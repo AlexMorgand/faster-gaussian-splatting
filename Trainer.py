@@ -1,10 +1,22 @@
 """FasterGS/Trainer.py"""
 
+from functools import partial
+from pathlib import Path
+
 import torch
 
 import Framework
 from Datasets.Base import BaseDataset
-from Datasets.utils import BasicPointCloud, apply_background_color
+from Datasets.utils import (
+    BasicPointCloud,
+    ImageData,
+    apply_background_color,
+    apply_image_scale_factor,
+    check_external_mask_tensor,
+    load_external_binary_mask,
+    load_image_simple,
+    resolve_external_mask_path,
+)
 from Logging import Logger
 from Methods.Base.GuiTrainer import GuiTrainer
 from Methods.Base.utils import pre_training_callback, training_callback, post_training_callback
@@ -40,6 +52,9 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         FILTER_VARIANCE=0.2,
     ),
     USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
+    RANDOM_BACKGROUND_IF_ALPHA_OR_MASK=True,  # when alpha/mask is available, composite GT and render on same random color
+    EXTERNAL_MASKS_PATH=None,  # directory containing binary per-image masks (0 ignore / 255 keep)
+    NORMALIZE_LOSS_BY_MASK_AREA=True,  # legacy; no effect with current loss (kept for configs)
     MIN_OPACITY_AFTER_TRAINING=1 / 255,
     RANDOM_INITIALIZATION=Framework.ConfigParameterList(
         FORCE=False,  # if True, the point cloud from the dataset will be ignored
@@ -83,6 +98,45 @@ class FasterGSTrainer(GuiTrainer):
     def create_sampler(self, _, dataset: 'BaseDataset') -> None:
         """Creates the sampler."""
         self.train_sampler = DatasetSampler(dataset=dataset.train(), random=True)
+
+    @pre_training_callback(priority=45)
+    @torch.no_grad()
+    def setup_external_masks(self, _, dataset: 'BaseDataset') -> None:
+        """Assigns external masks to training views if configured."""
+        if self.__class__ is not FasterGSTrainer:
+            return
+        if self.EXTERNAL_MASKS_PATH in (None, ''):
+            return
+        mask_root = Path(self.EXTERNAL_MASKS_PATH).expanduser()
+        if not mask_root.exists() or not mask_root.is_dir():
+            raise Framework.TrainingError(f'invalid EXTERNAL_MASKS_PATH: "{mask_root}"')
+
+        num_views = 0
+        images_root = dataset.dataset_path / 'images'
+        for view in dataset.train():
+            rgb_data = getattr(view, '_rgb', None)
+            if rgb_data is None:
+                raise Framework.TrainingError('cannot assign external masks: view has no RGB data')
+            mask_path = resolve_external_mask_path(mask_root, rgb_data.path, images_root)
+            if mask_path is None:
+                raise Framework.TrainingError(
+                    f'no external mask found for image "{rgb_data.path}" in "{mask_root}"'
+                )
+            view.segmentation = ImageData(
+                path=mask_path,
+                n_channels=1,
+                scale_factor=rgb_data.scale_factor,
+                load_fn=load_external_binary_mask,
+                resize_fn=partial(apply_image_scale_factor, mode='nearest'),
+            )
+            num_views += 1
+        if self.DATA.PRELOADING_LEVEL > 0:
+            to_default_device = self.DATA.PRELOADING_LEVEL == 2
+            for view in dataset.train():
+                segmentation_data = getattr(view, '_segmentation', None)
+                if isinstance(segmentation_data, ImageData):
+                    segmentation_data.prefetch(to_default_device=to_default_device)
+        Logger.log_info(f'using external masks from "{mask_root}" for {num_views} training views')
 
     @pre_training_callback(priority=40)
     @torch.no_grad()
@@ -175,8 +229,22 @@ class FasterGSTrainer(GuiTrainer):
         self.model.gaussians.update_learning_rate(iteration + 1)
         # get random view
         view = self.train_sampler.get(dataset=dataset)['view']
+        external_mask = None
+        if self.__class__ is FasterGSTrainer and self.EXTERNAL_MASKS_PATH not in (None, ''):
+            external_mask = view.segmentation
+            if external_mask is None:
+                raise Framework.TrainingError('external masks enabled but current view has no segmentation mask')
+            label = str(getattr(getattr(view, '_rgb', None), 'path', 'unknown'))
+            external_mask = check_external_mask_tensor(external_mask, view.rgb, label)
+        alpha_gt = view.alpha
+        supervision_alpha = alpha_gt
+        if external_mask is not None:
+            supervision_alpha = external_mask if supervision_alpha is None else supervision_alpha * external_mask
         # render
-        bg_color = torch.rand_like(view.camera.background_color) if self.USE_RANDOM_BACKGROUND_COLOR else view.camera.background_color
+        use_random_bg = self.USE_RANDOM_BACKGROUND_COLOR or (
+            self.RANDOM_BACKGROUND_IF_ALPHA_OR_MASK and supervision_alpha is not None
+        )
+        bg_color = torch.rand_like(view.camera.background_color) if use_random_bg else view.camera.background_color
         image = self.renderer.render_image_training(
             view=view,
             update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
@@ -185,8 +253,8 @@ class FasterGSTrainer(GuiTrainer):
         # calculate loss
         # compose gt with background color if needed  # FIXME: integrate into data model
         rgb_gt = view.rgb
-        if (alpha_gt := view.alpha) is not None:
-            rgb_gt = apply_background_color(rgb_gt, alpha_gt, bg_color)
+        if supervision_alpha is not None:
+            rgb_gt = apply_background_color(rgb_gt, supervision_alpha, bg_color)
         loss = self.loss(image, rgb_gt)
         # backward
         loss.backward()
