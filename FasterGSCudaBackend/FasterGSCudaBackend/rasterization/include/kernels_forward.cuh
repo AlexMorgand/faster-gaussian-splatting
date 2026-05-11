@@ -25,6 +25,8 @@ namespace faster_gs::rasterization::kernels::forward {
         uint* __restrict__ primitive_n_touched_tiles,
         ushort4* __restrict__ primitive_screen_bounds,
         float2* __restrict__ primitive_mean2d,
+        float* __restrict__ primitive_depth,
+        float3* __restrict__ primitive_normal,
         float4* __restrict__ primitive_conic_opacity,
         float3* __restrict__ primitive_color,
         uint* __restrict__ n_visible_primitives,
@@ -194,6 +196,8 @@ namespace faster_gs::rasterization::kernels::forward {
             static_cast<ushort>(screen_bounds.w)
         );
         primitive_mean2d[primitive_idx] = mean2d;
+        primitive_depth[primitive_idx] = depth;
+        primitive_normal[primitive_idx] = make_float3(R.m13, R.m23, R.m33);
         primitive_conic_opacity[primitive_idx] = make_float4(conic, opacity);
         const float3 color = convert_sh_to_color(
             sh_coefficients_0, sh_coefficients_rest,
@@ -365,10 +369,13 @@ namespace faster_gs::rasterization::kernels::forward {
         const uint* __restrict__ tile_buckets_offset,
         const uint* __restrict__ instance_primitive_indices,
         const float2* __restrict__ primitive_mean2d,
+        const float* __restrict__ primitive_depth,
+        const float3* __restrict__ primitive_normal,
         const float4* __restrict__ primitive_conic_opacity,
         const float3* __restrict__ primitive_color,
         const float3* __restrict__ bg_color,
         float* __restrict__ image,
+        float* __restrict__ auxiliary_maps,
         float* __restrict__ tile_final_transmittances,
         uint* __restrict__ tile_max_n_processed,
         uint* __restrict__ tile_n_processed,
@@ -401,6 +408,10 @@ namespace faster_gs::rasterization::kernels::forward {
         __shared__ float3 collected_color[config::block_size_blend];
         // initialize local storage
         float3 color_pixel = make_float3(0.0f);
+        float3 normal_pixel = make_float3(0.0f);
+        float alpha_pixel = 0.0f;
+        float depth_pixel = 0.0f;
+        float depth_sq_pixel = 0.0f;
         float transmittance = 1.0f;
         uint n_processed = 0;
         uint n_processed_and_used = 0;
@@ -440,7 +451,14 @@ namespace faster_gs::rasterization::kernels::forward {
                 if (config::original_opacity_interpretation && alpha < config::min_alpha_threshold) continue;
 
                 // blend fragment into pixel color
-                color_pixel += transmittance * alpha * collected_color[j];
+                const float blending_weight = transmittance * alpha;
+                color_pixel += blending_weight * collected_color[j];
+                alpha_pixel += blending_weight;
+                const uint primitive_idx = instance_primitive_indices[current_fetch_idx - thread_rank + j];
+                const float depth = primitive_depth[primitive_idx];
+                depth_pixel += blending_weight * depth;
+                depth_sq_pixel += blending_weight * depth * depth;
+                normal_pixel += blending_weight * primitive_normal[primitive_idx];
 
                 // update transmittance
                 transmittance *= 1.0f - alpha;
@@ -464,6 +482,21 @@ namespace faster_gs::rasterization::kernels::forward {
             image[pixel_idx] = color_pixel.x;
             image[n_pixels + pixel_idx] = color_pixel.y;
             image[2 * n_pixels + pixel_idx] = color_pixel.z;
+            auxiliary_maps[pixel_idx] = alpha_pixel;
+            const float alpha_safe = fmaxf(alpha_pixel, 1e-8f);
+            const float alpha_rcp = 1.0f / alpha_safe;
+            const float depth_mean = depth_pixel * alpha_rcp;
+            const float depth_sq_mean = depth_sq_pixel * alpha_rcp;
+            auxiliary_maps[n_pixels + pixel_idx] = depth_mean;
+            auxiliary_maps[2 * n_pixels + pixel_idx] = fmaxf(0.0f, depth_sq_mean - depth_mean * depth_mean);
+            // Match depth: store weighted-average surface normal (same alpha weights as depth_mean).
+            const float3 normal_mean = make_float3(
+                normal_pixel.x * alpha_rcp,
+                normal_pixel.y * alpha_rcp,
+                normal_pixel.z * alpha_rcp);
+            auxiliary_maps[3 * n_pixels + pixel_idx] = normal_mean.x;
+            auxiliary_maps[4 * n_pixels + pixel_idx] = normal_mean.y;
+            auxiliary_maps[5 * n_pixels + pixel_idx] = normal_mean.z;
             tile_final_transmittances[pixel_idx] = transmittance;
             tile_n_processed[pixel_idx] = n_processed_and_used;
         }

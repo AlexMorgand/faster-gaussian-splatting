@@ -11,7 +11,7 @@ __install_command__ = [
 ]
 
 try:
-    from .FasterGSCudaBackend.torch_bindings.rasterization import diff_rasterize, rasterize, update_pruning_scores, RasterizerSettings
+    from .FasterGSCudaBackend.torch_bindings.rasterization import diff_rasterize, diff_rasterize_with_aux, rasterize, update_pruning_scores, RasterizerSettings
     from .FasterGSCudaBackend.torch_bindings.adam import FusedAdam
     from .FasterGSCudaBackend.torch_bindings.filter3d import update_3d_filter
     from .FasterGSCudaBackend.torch_bindings.densification import relocation_adjustment, add_noise

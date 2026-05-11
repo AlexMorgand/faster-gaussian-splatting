@@ -51,6 +51,8 @@ namespace faster_gs::rasterization {
         uint* offset;
         ushort4* screen_bounds;
         float2* mean2d;
+        float* depth;
+        float3* normal;
         float4* conic_opacity;
         float3* color;
         uint* n_visible_primitives;
@@ -72,6 +74,8 @@ namespace faster_gs::rasterization {
             obtain(blob, buffers.offset, n_primitives);
             obtain(blob, buffers.screen_bounds, n_primitives);
             obtain(blob, buffers.mean2d, n_primitives);
+            obtain(blob, buffers.depth, n_primitives);
+            obtain(blob, buffers.normal, n_primitives);
             obtain(blob, buffers.conic_opacity, n_primitives);
             obtain(blob, buffers.color, n_primitives);
             cub::DeviceScan::ExclusiveSum(

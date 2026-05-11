@@ -10,7 +10,7 @@
 #include <functional>
 #include <tuple>
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, int, int>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, int, int>
 faster_gs::rasterization::forward_wrapper(
     const torch::Tensor& means,
     const torch::Tensor& scales,
@@ -45,6 +45,7 @@ faster_gs::rasterization::forward_wrapper(
     const torch::TensorOptions float_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
     const torch::TensorOptions byte_options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
     torch::Tensor image = torch::empty({3, height, width}, float_options);
+    torch::Tensor auxiliary_maps = torch::empty({6, height, width}, float_options);
     torch::Tensor primitive_buffers = torch::empty({0}, byte_options);
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
@@ -69,6 +70,7 @@ faster_gs::rasterization::forward_wrapper(
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
+        auxiliary_maps.data_ptr<float>(),
         n_primitives,
         active_sh_bases,
         total_sh_bases,
@@ -85,6 +87,7 @@ faster_gs::rasterization::forward_wrapper(
 
     return {
         image,
+        auxiliary_maps,
         primitive_buffers, tile_buffers, instance_buffers, bucket_buffers,
         n_instances, n_buckets, instance_primitive_indices_selector
     };

@@ -560,7 +560,7 @@ class FasterGSModel(BaseModel):
             return data
 
         # add method-specific comments
-        splat_render_mode = 'mip-0.1' if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
+        splat_render_mode = 'mip-0.1'# if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
         data['comments'] = [f'SplatRenderMode: {splat_render_mode}', 'Generated with NeRFICG/FasterGS']
 
         return data
