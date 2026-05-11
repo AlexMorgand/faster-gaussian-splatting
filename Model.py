@@ -4,6 +4,7 @@ import math
 
 import torch
 import numpy as np
+from plyfile import PlyData
 
 import Framework
 from Cameras.Perspective import PerspectiveCamera
@@ -12,12 +13,16 @@ from Datasets.Base import BaseDataset
 from Datasets.utils import BasicPointCloud
 from Logging import Logger
 from Methods.Base.Model import BaseModel
-from Cameras.utils import quaternion_to_rotation_matrix
+from Cameras.utils import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion
 from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, relocation_adjustment, add_noise
 from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
 from Optim.knn_utils import compute_root_mean_squared_knn_distances
 from Optim.ppisp import PPISPWrapper
+
+# splat-transform / SuperSplat "compressed PLY": chunked quantized splats (see playcanvas/splat-transform decompress-ply.ts)
+_COMPRESSED_PLY_CHUNK_SIZE = 256
+_SH_C0 = 0.28209479177387814
 
 
 class Gaussians(torch.nn.Module):
@@ -44,6 +49,143 @@ class Gaussians(torch.nn.Module):
         self.distance2filter = 0
         self.lr_means = 0.0
         self.lr_means_scheduler = None
+
+    @staticmethod
+    def _get_ply_property_names(vertices) -> list[str]:
+        return [prop.name for prop in vertices.properties]
+
+    @staticmethod
+    def _require_ply_properties(path: str, property_names: list[str], required: list[str]) -> None:
+        missing = [name for name in required if name not in property_names]
+        if missing:
+            raise Framework.ModelError(f'invalid Gaussian PLY "{path}": missing required vertex properties {missing}')
+
+    @staticmethod
+    def _unpack_unorm_uint32(values: np.ndarray, bits: int) -> np.ndarray:
+        t = float((1 << bits) - 1)
+        return (values.astype(np.uint32) & ((1 << bits) - 1)).astype(np.float32) / t
+
+    @classmethod
+    def _is_compressed_splat_transform_ply(cls, plydata: PlyData) -> bool:
+        """True if PLY matches splat-transform compressed schema (chunk + packed_vertex)."""
+        if 'chunk' not in plydata or 'vertex' not in plydata:
+            return False
+        vertex_props = cls._get_ply_property_names(plydata['vertex'])
+        required_v = ('packed_position', 'packed_rotation', 'packed_scale', 'packed_color')
+        if not all(p in vertex_props for p in required_v):
+            return False
+        n_vertex = plydata['vertex'].count
+        n_chunk = plydata['chunk'].count
+        return int(np.ceil(n_vertex / _COMPRESSED_PLY_CHUNK_SIZE)) == n_chunk
+
+    @classmethod
+    def _decompress_splat_transform_ply(cls, plydata: PlyData, path: str, max_sh_degree: int) -> tuple[np.ndarray, ...]:
+        """Decompress splat-transform compressed PLY to same arrays as standard Gaussian PLY."""
+        chunk_el = plydata['chunk']
+        vtx_el = plydata['vertex']
+
+        min_x = np.asarray(chunk_el['min_x'], dtype=np.float32)
+        min_y = np.asarray(chunk_el['min_y'], dtype=np.float32)
+        min_z = np.asarray(chunk_el['min_z'], dtype=np.float32)
+        max_x = np.asarray(chunk_el['max_x'], dtype=np.float32)
+        max_y = np.asarray(chunk_el['max_y'], dtype=np.float32)
+        max_z = np.asarray(chunk_el['max_z'], dtype=np.float32)
+        min_scale_x = np.asarray(chunk_el['min_scale_x'], dtype=np.float32)
+        min_scale_y = np.asarray(chunk_el['min_scale_y'], dtype=np.float32)
+        min_scale_z = np.asarray(chunk_el['min_scale_z'], dtype=np.float32)
+        max_scale_x = np.asarray(chunk_el['max_scale_x'], dtype=np.float32)
+        max_scale_y = np.asarray(chunk_el['max_scale_y'], dtype=np.float32)
+        max_scale_z = np.asarray(chunk_el['max_scale_z'], dtype=np.float32)
+
+        prop_chunk = cls._get_ply_property_names(chunk_el)
+        has_chunk_colors = 'min_r' in prop_chunk
+        if has_chunk_colors:
+            min_r = np.asarray(chunk_el['min_r'], dtype=np.float32)
+            min_g = np.asarray(chunk_el['min_g'], dtype=np.float32)
+            min_b = np.asarray(chunk_el['min_b'], dtype=np.float32)
+            max_r = np.asarray(chunk_el['max_r'], dtype=np.float32)
+            max_g = np.asarray(chunk_el['max_g'], dtype=np.float32)
+            max_b = np.asarray(chunk_el['max_b'], dtype=np.float32)
+
+        packed_position = np.asarray(vtx_el['packed_position']).astype(np.uint32)
+        packed_rotation = np.asarray(vtx_el['packed_rotation']).astype(np.uint32)
+        packed_scale = np.asarray(vtx_el['packed_scale']).astype(np.uint32)
+        packed_color = np.asarray(vtx_el['packed_color']).astype(np.uint32)
+
+        n = packed_position.shape[0]
+        ci = np.minimum(np.arange(n, dtype=np.int64) // _COMPRESSED_PLY_CHUNK_SIZE, min_x.shape[0] - 1)
+
+        px = cls._unpack_unorm_uint32(packed_position >> 21, 11)
+        py = cls._unpack_unorm_uint32(packed_position >> 11, 10)
+        pz = cls._unpack_unorm_uint32(packed_position, 11)
+        means = np.empty((n, 3), dtype=np.float32)
+        means[:, 0] = min_x[ci] * (1.0 - px) + max_x[ci] * px
+        means[:, 1] = min_y[ci] * (1.0 - py) + max_y[ci] * py
+        means[:, 2] = min_z[ci] * (1.0 - pz) + max_z[ci] * pz
+
+        sx = cls._unpack_unorm_uint32(packed_scale >> 21, 11)
+        sy = cls._unpack_unorm_uint32(packed_scale >> 11, 10)
+        sz = cls._unpack_unorm_uint32(packed_scale, 11)
+        scales_lin = np.empty((n, 3), dtype=np.float32)
+        scales_lin[:, 0] = min_scale_x[ci] * (1.0 - sx) + max_scale_x[ci] * sx
+        scales_lin[:, 1] = min_scale_y[ci] * (1.0 - sy) + max_scale_y[ci] * sy
+        scales_lin[:, 2] = min_scale_z[ci] * (1.0 - sz) + max_scale_z[ci] * sz
+        scales = np.log(np.maximum(scales_lin, 1e-12))
+
+        cx = cls._unpack_unorm_uint32(packed_color >> 24, 8)
+        cy = cls._unpack_unorm_uint32(packed_color >> 16, 8)
+        cz = cls._unpack_unorm_uint32(packed_color >> 8, 8)
+        cw = cls._unpack_unorm_uint32(packed_color, 8)
+        if has_chunk_colors:
+            cr = min_r[ci] * (1.0 - cx) + max_r[ci] * cx
+            cg = min_g[ci] * (1.0 - cy) + max_g[ci] * cy
+            cb = min_b[ci] * (1.0 - cz) + max_b[ci] * cz
+        else:
+            cr, cg, cb = cx, cy, cz
+        sh0 = np.stack([(cr - 0.5) / _SH_C0, (cg - 0.5) / _SH_C0, (cb - 0.5) / _SH_C0], axis=1)[:, None, :]
+
+        opacity_alpha = np.clip(cw, 1e-6, 1.0 - 1e-6)
+        opacities = (np.log(opacity_alpha / (1.0 - opacity_alpha))).astype(np.float32)[:, None]
+
+        norm = np.float32(np.sqrt(2.0))
+        a = (cls._unpack_unorm_uint32(packed_rotation >> 20, 10) - 0.5) * norm
+        b = (cls._unpack_unorm_uint32(packed_rotation >> 10, 10) - 0.5) * norm
+        c = (cls._unpack_unorm_uint32(packed_rotation, 10) - 0.5) * norm
+        m = np.sqrt(np.maximum(0.0, 1.0 - (a * a + b * b + c * c))).astype(np.float32)
+        which = packed_rotation >> 30
+        r0 = np.where(which == 0, m, np.where(which == 1, a, np.where(which == 2, a, a)))
+        r1 = np.where(which == 0, a, np.where(which == 1, m, np.where(which == 2, b, b)))
+        r2 = np.where(which == 0, b, np.where(which == 1, b, np.where(which == 2, m, c)))
+        r3 = np.where(which == 0, c, np.where(which == 1, c, np.where(which == 2, c, m)))
+        rotations = np.stack([r0, r1, r2, r3], axis=1)
+
+        expected_rest = (max_sh_degree + 1) ** 2 - 1
+        sh_rest = np.zeros((n, expected_rest, 3), dtype=np.float32)
+        if 'sh' in plydata:
+            sh_el = plydata['sh']
+            sh_rest_names = sorted(
+                [p.name for p in sh_el.properties if p.name.startswith('f_rest_')],
+                key=lambda x: int(x.split('_')[-1]),
+            )
+            n_sh_cols = len(sh_rest_names)
+            if n_sh_cols > 0 and sh_el.count != n:
+                raise Framework.ModelError(
+                    f'compressed Gaussian PLY "{path}": vertex count {n} != sh count {sh_el.count}'
+                )
+            num_rest_in_file = n_sh_cols // 3
+            if n_sh_cols % 3 != 0:
+                raise Framework.ModelError(f'compressed Gaussian PLY "{path}": unexpected SH column count {n_sh_cols}')
+            for k, name in enumerate(sh_rest_names):
+                col = np.asarray(sh_el[name], dtype=np.uint8)
+                n_lin = np.where(col == 0, 0.0, np.where(col == 255, 1.0, (col.astype(np.float32) + 0.5) / 256.0))
+                decoded = ((n_lin - 0.5) * 8.0).astype(np.float32)
+                basis = k % num_rest_in_file
+                channel = k // num_rest_in_file
+                if basis < expected_rest:
+                    sh_rest[:, basis, channel] = decoded
+
+        Logger.log_info(f'decompressed splat-transform compressed PLY ({n:,} splats)')
+        return means, sh0, sh_rest, scales, rotations, opacities
 
     @property
     def means(self) -> torch.Tensor:
@@ -227,30 +369,122 @@ class Gaussians(torch.nn.Module):
         self._rotations = torch.nn.Parameter(rotations.contiguous())
         self._opacities = torch.nn.Parameter(opacities.contiguous())
 
-    def training_setup(self, training_wrapper, training_cameras_extent: float) -> None:
+    def initialize_from_gaussian_ply(self, path: str) -> None:
+        """Initializes the model from a Gaussian PLY with explicit Gaussian attributes."""
+        try:
+            plydata = PlyData.read(path)
+        except Exception as exc:
+            raise Framework.ModelError(f'failed to read Gaussian PLY "{path}": {exc}') from exc
+        if 'vertex' not in plydata:
+            raise Framework.ModelError(f'invalid Gaussian PLY "{path}": no "vertex" element')
+
+        if self._is_compressed_splat_transform_ply(plydata):
+            means, sh_coefficients_0, sh_coefficients_rest, scales, rotations, opacities = self._decompress_splat_transform_ply(
+                plydata, path, self.max_sh_degree
+            )
+            n_initial_gaussians = means.shape[0]
+            Logger.log_info(f'number of Gaussians loaded from PLY: {n_initial_gaussians:,}')
+            self._means = torch.nn.Parameter(torch.from_numpy(means).cuda().contiguous())
+            self._sh_coefficients_0 = torch.nn.Parameter(torch.from_numpy(sh_coefficients_0).cuda().contiguous())
+            self._sh_coefficients_rest = torch.nn.Parameter(torch.from_numpy(sh_coefficients_rest).cuda().contiguous())
+            self._scales = torch.nn.Parameter(torch.from_numpy(scales).cuda().contiguous())
+            self._rotations = torch.nn.Parameter(torch.from_numpy(rotations).cuda().contiguous())
+            self._opacities = torch.nn.Parameter(torch.from_numpy(opacities).cuda().contiguous())
+            return
+
+        vertices = plydata['vertex']
+        property_names = self._get_ply_property_names(vertices)
+        self._require_ply_properties(path, property_names, ['x', 'y', 'z', 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'])
+
+        means = np.column_stack((vertices['x'], vertices['y'], vertices['z'])).astype(np.float32)
+        sh0_names = ['f_dc_0', 'f_dc_1', 'f_dc_2']
+        has_sh0 = all(name in property_names for name in sh0_names)
+        if has_sh0:
+            sh_coefficients_0 = np.column_stack((vertices['f_dc_0'], vertices['f_dc_1'], vertices['f_dc_2'])).astype(np.float32)[:, None, :]
+        else:
+            sh_coefficients_0 = np.zeros((means.shape[0], 1, 3), dtype=np.float32)
+
+        f_rest_names = sorted(
+            [name for name in property_names if name.startswith('f_rest_')],
+            key=lambda n: int(n.split('_')[-1]),
+        )
+        expected_rest = (self.max_sh_degree + 1) ** 2 - 1
+        if len(f_rest_names) >= 3:
+            f_rest = np.stack([vertices[name] for name in f_rest_names], axis=1).astype(np.float32)
+            rest_bases_available = f_rest.shape[1] // 3
+            rest_bases_used = min(rest_bases_available, expected_rest)
+            sh_coefficients_rest = np.zeros((means.shape[0], expected_rest, 3), dtype=np.float32)
+            sh_coefficients_rest[:, :rest_bases_used, :] = f_rest[:, :rest_bases_used * 3].reshape(means.shape[0], rest_bases_used, 3)
+        else:
+            sh_coefficients_rest = np.zeros((means.shape[0], expected_rest, 3), dtype=np.float32)
+
+        scales = np.column_stack((vertices['scale_0'], vertices['scale_1'], vertices['scale_2'])).astype(np.float32)
+        rotations = np.column_stack((vertices['rot_0'], vertices['rot_1'], vertices['rot_2'], vertices['rot_3'])).astype(np.float32)
+        opacities = np.asarray(vertices['opacity']).astype(np.float32)[:, None]
+
+        n_initial_gaussians = means.shape[0]
+        Logger.log_info(f'number of Gaussians loaded from PLY: {n_initial_gaussians:,}')
+
+        self._means = torch.nn.Parameter(torch.from_numpy(means).cuda().contiguous())
+        self._sh_coefficients_0 = torch.nn.Parameter(torch.from_numpy(sh_coefficients_0).cuda().contiguous())
+        self._sh_coefficients_rest = torch.nn.Parameter(torch.from_numpy(sh_coefficients_rest).cuda().contiguous())
+        self._scales = torch.nn.Parameter(torch.from_numpy(scales).cuda().contiguous())
+        self._rotations = torch.nn.Parameter(torch.from_numpy(rotations).cuda().contiguous())
+        self._opacities = torch.nn.Parameter(torch.from_numpy(opacities).cuda().contiguous())
+
+    @torch.no_grad()
+    def apply_scene_alignment_transform(self, transform: np.ndarray) -> None:
+        """
+        Apply the same rigid + optional uniform scale as dataset PCA (see BasicPointCloud.transform).
+
+        Means use the full linear part L = T[:3,:3]; rotations use orthogonal part R = L/s with
+        s = ||L[:, 0]|| (uniform scale from APPLY_PCA_RESCALE); log-scales get +log(s).
+        """
+        T = torch.as_tensor(np.asarray(transform, dtype=np.float32), device=self._means.device)
+        L = T[:3, :3]
+        t = T[:3, 3]
+        means = self._means.data
+        means.copy_(means @ L.T + t)
+        s = torch.linalg.norm(L[:, 0]).clamp_min(1e-12)
+        R_align = L / s
+        Rs = quaternion_to_rotation_matrix(self._rotations.data, normalize=True)
+        R_out = torch.matmul(R_align.unsqueeze(0), Rs)
+        q = rotation_matrix_to_quaternion(R_out)
+        self._rotations.data.copy_(q)
+        if (s - 1.0).abs() > 1e-6:
+            self._scales.data.add_(torch.log(s))
+        Logger.log_info('applied dataset scene_alignment_transform to Gaussian PLY init (means, rotations, scales)')
+
+    def training_setup(self, training_wrapper, training_cameras_extent: float, freeze_geometry: bool = False) -> None:
         """Sets up the optimizer."""
         self.percent_dense = training_wrapper.DENSIFICATION_PERCENT_DENSE
         self.training_cameras_extent = training_cameras_extent
 
         param_groups = [
-            {'params': [self._means], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent, 'name': 'means'},
+            {'params': [self._means], 'lr': 0.0 if freeze_geometry else training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent, 'name': 'means'},
             {'params': [self._sh_coefficients_0], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_SH_COEFFICIENTS_0, 'name': 'sh_coefficients_0'},
             {'params': [self._sh_coefficients_rest], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_SH_COEFFICIENTS_REST, 'name': 'sh_coefficients_rest'},
             {'params': [self._opacities], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_OPACITIES, 'name': 'opacities'},
-            {'params': [self._scales], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_SCALES, 'name': 'scales'},
-            {'params': [self._rotations], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'}
+            {'params': [self._scales], 'lr': 0.0 if freeze_geometry else training_wrapper.OPTIMIZER.LEARNING_RATE_SCALES, 'name': 'scales'},
+            {'params': [self._rotations], 'lr': 0.0 if freeze_geometry else training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'}
         ]
 
         self.optimizer = FusedAdam(param_groups, lr=0.0, eps=1e-15)
 
-        self.lr_means_scheduler = LRDecayPolicy(
-            lr_init=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent,
-            lr_final=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_FINAL * self.training_cameras_extent,
-            max_steps=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_MAX_STEPS
-        )
+        if freeze_geometry:
+            self.lr_means_scheduler = None
+            self.lr_means = 0.0
+        else:
+            self.lr_means_scheduler = LRDecayPolicy(
+                lr_init=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent,
+                lr_final=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_FINAL * self.training_cameras_extent,
+                max_steps=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_MAX_STEPS
+            )
 
     def update_learning_rate(self, iteration: int) -> None:
         """Computes the current learning rate for the given iteration."""
+        if self.lr_means_scheduler is None:
+            return
         self.lr_means = self.lr_means_scheduler(iteration)
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == 'means':
@@ -454,6 +688,8 @@ class Gaussians(torch.nn.Module):
 
     def apply_morton_ordering(self) -> None:
         """Applies Morton ordering to the Gaussians."""
+        if self._means is None or self._means.shape[0] == 0:
+            return
         morton_encoding = morton_encode(self._means.data)
         order = torch.argsort(morton_encoding)
         self.sort(order)

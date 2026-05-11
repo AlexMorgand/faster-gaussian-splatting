@@ -40,6 +40,14 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         FILTER_VARIANCE=0.2,
     ),
     USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
+    RANDOM_BACKGROUND_IF_ALPHA_OR_MASK=True,  # when alpha/mask is available, composite GT and render on same random color
+    INITIALIZATION_GAUSSIAN_PLY_PATH=None,  # optional Gaussian PLY initialization (e.g. Mesh2Splat output)
+    FREEZE_INITIAL_GAUSSIAN_GEOMETRY=True,  # when using INITIALIZATION_GAUSSIAN_PLY_PATH, freeze means/scales/rotations
+    KEEP_THIN_SPLATS=True,  # when using INITIALIZATION_GAUSSIAN_PLY_PATH, avoid opacity resets that remove very thin details
+    ENABLE_DENSIFICATION_WITH_GAUSSIAN_PLY_INIT=False,  # default off to preserve initialization geometry
+    DENSIFICATION_GRAD_THRESHOLD_MULTIPLIER_GAUSSIAN_PLY_INIT=4.0,  # used only when densification is enabled with Gaussian PLY init
+    DENSIFICATION_INTERVAL_MULTIPLIER_GAUSSIAN_PLY_INIT=4,  # used only when densification is enabled with Gaussian PLY init
+    NORMALIZE_LOSS_BY_MASK_AREA=True,  # legacy; no effect with current loss (kept for configs)
     MIN_OPACITY_AFTER_TRAINING=1 / 255,
     RANDOM_INITIALIZATION=Framework.ConfigParameterList(
         FORCE=False,  # if True, the point cloud from the dataset will be ignored
@@ -77,6 +85,7 @@ class FasterGSTrainer(GuiTrainer):
         super().__init__(**kwargs)
         self.train_sampler = None
         self.loss = None
+        self._gaussian_ply_init_active = False
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -93,23 +102,36 @@ class FasterGSTrainer(GuiTrainer):
         radius = (1.1 * torch.max(torch.linalg.norm(camera_centers - torch.mean(camera_centers, dim=0), dim=1))).item()
         Logger.log_info(f'training cameras extent: {radius:.2f}')
 
-        if dataset.point_cloud is not None and not self.RANDOM_INITIALIZATION.FORCE:
+        ply_path = self.INITIALIZATION_GAUSSIAN_PLY_PATH
+        if ply_path not in (None, ''):
+            self.model.gaussians.initialize_from_gaussian_ply(str(Path(ply_path).expanduser()))
+            self._gaussian_ply_init_active = True
+            if getattr(dataset, 'scene_alignment_transform', None) is not None:
+                self.model.gaussians.apply_scene_alignment_transform(dataset.scene_alignment_transform)
+        elif dataset.point_cloud is not None and not self.RANDOM_INITIALIZATION.FORCE:
             point_cloud = dataset.point_cloud
+            self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
         else:
             samples = torch.rand((self.RANDOM_INITIALIZATION.N_POINTS, 3), dtype=torch.float32, device=Framework.config.GLOBAL.DEFAULT_DEVICE)
             positions = samples * dataset.bounding_box.size + dataset.bounding_box.min
             if self.RANDOM_INITIALIZATION.ENABLE_CARVING:
                 positions = carve(positions, dataset, self.RANDOM_INITIALIZATION.CARVING_IN_ALL_FRUSTUMS, self.RANDOM_INITIALIZATION.CARVING_ENFORCE_ALPHA)
             point_cloud = BasicPointCloud(positions)
-        self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
-        self.model.gaussians.training_setup(self, radius)
+            self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
+        self.model.gaussians.training_setup(self, radius, freeze_geometry=self._gaussian_ply_init_active and self.FREEZE_INITIAL_GAUSSIAN_GEOMETRY)
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info()
-        if self.FILTER_3D.USE:
+        if self.FILTER_3D.USE and not self._gaussian_ply_init_active:
             self.model.gaussians.setup_3d_filter(self.FILTER_3D, dataset)
         if self.model.ppisp is not None:
             self.model.ppisp.initialize(dataset, self.NUM_ITERATIONS)
         self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
+        if self._gaussian_ply_init_active:
+            Logger.log_info(
+                f'using Gaussian PLY initialization from "{Path(ply_path).expanduser()}" '
+                f'(freeze_geometry={self.FREEZE_INITIAL_GAUSSIAN_GEOMETRY}, '
+                f'densification={self.ENABLE_DENSIFICATION_WITH_GAUSSIAN_PLY_INIT})'
+            )
 
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
@@ -121,10 +143,21 @@ class FasterGSTrainer(GuiTrainer):
     @torch.no_grad()
     def densify(self, iteration: int, dataset: 'BaseDataset') -> None:
         """Apply densification."""
+        if self._gaussian_ply_init_active and not self.ENABLE_DENSIFICATION_WITH_GAUSSIAN_PLY_INIT:
+            return
+
+        interval_multiplier = self.DENSIFICATION_INTERVAL_MULTIPLIER_GAUSSIAN_PLY_INIT if self._gaussian_ply_init_active else 1
+        effective_interval = max(1, self.DENSIFICATION_INTERVAL * interval_multiplier)
+        if (iteration - self.DENSIFICATION_START_ITERATION) % effective_interval != 0:
+            return
+
         if self.USE_MCMC:
             self.model.gaussians.mcmc_densification(min_opacity=0.005, cap_max=self.MAX_PRIMITIVES)
         else:
-            self.model.gaussians.adaptive_density_control(self.DENSIFICATION_GRAD_THRESHOLD, 0.005, iteration > self.OPACITY_RESET_INTERVAL)
+            grad_threshold = self.DENSIFICATION_GRAD_THRESHOLD
+            if self._gaussian_ply_init_active:
+                grad_threshold *= self.DENSIFICATION_GRAD_THRESHOLD_MULTIPLIER_GAUSSIAN_PLY_INIT
+            self.model.gaussians.adaptive_density_control(grad_threshold, 0.005, iteration > self.OPACITY_RESET_INTERVAL)
 
             if self.SPEEDYSPLAT_PRUNING.USE and self.SPEEDYSPLAT_PRUNING.START_ITERATION <= iteration < self.SPEEDYSPLAT_PRUNING.END_ITERATION and iteration % self.SPEEDYSPLAT_PRUNING.INTERVAL == 0:
                 # Soft Pruning (see https://github.com/j-alex-hanson/speedy-splat/blob/e480b2c3944e4aac4e251307216fe1b8d6a0afc3/train.py#L178-L188)
@@ -135,7 +168,7 @@ class FasterGSTrainer(GuiTrainer):
                 self.model.gaussians.reset_densification_info()
         if self.requires_empty_cache:
             torch.cuda.empty_cache()
-        if self.FILTER_3D.USE:
+        if self.FILTER_3D.USE and not self._gaussian_ply_init_active:
             self.model.gaussians.compute_3d_filter(dataset.train())
 
     @training_callback(priority=99, end_iteration='MORTON_ORDERING_END_ITERATION', iteration_stride='MORTON_ORDERING_INTERVAL')
@@ -148,6 +181,8 @@ class FasterGSTrainer(GuiTrainer):
     @torch.no_grad()
     def recompute_3d_filter(self, iteration: int, dataset: 'BaseDataset') -> None:
         """Recompute 3D filter."""
+        if self._gaussian_ply_init_active:
+            return
         if self.DENSIFICATION_END_ITERATION < iteration < self.NUM_ITERATIONS - 100:
             self.model.gaussians.compute_3d_filter(dataset.train())
 
@@ -155,6 +190,8 @@ class FasterGSTrainer(GuiTrainer):
     @torch.no_grad()
     def reset_opacities(self, *_) -> None:
         """Reset opacities."""
+        if self._gaussian_ply_init_active and self.KEEP_THIN_SPLATS:
+            return
         if not self.USE_MCMC:
             self.model.gaussians.reset_opacities()
 
@@ -162,6 +199,8 @@ class FasterGSTrainer(GuiTrainer):
     @torch.no_grad()
     def reset_opacities_extra(self, _, dataset: 'BaseDataset') -> None:
         """Reset opacities one additional time when using a white background."""
+        if self._gaussian_ply_init_active and self.KEEP_THIN_SPLATS:
+            return
         # original implementation only supports black or white background, this is an attempt to make it work with any color
         if not self.USE_MCMC and dataset.default_camera.background_color.sum() != 0.0:
             Logger.log_info('resetting opacities one additional time because using non-black background')
@@ -178,7 +217,11 @@ class FasterGSTrainer(GuiTrainer):
         self.model.gaussians.update_learning_rate(iteration + 1)
         # get random view
         view = self.train_sampler.get(dataset=dataset)['view']
-        bg_color = torch.rand_like(view.camera.background_color) if self.USE_RANDOM_BACKGROUND_COLOR else view.camera.background_color
+        supervision_alpha = get_supervision_alpha(view)
+        use_random_bg = self.USE_RANDOM_BACKGROUND_COLOR or (
+            self.RANDOM_BACKGROUND_IF_ALPHA_OR_MASK and supervision_alpha is not None
+        )
+        bg_color = torch.rand_like(view.camera.background_color) if use_random_bg else view.camera.background_color
         image = self.renderer.render_image_training(
             view=view,
             update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
@@ -187,7 +230,7 @@ class FasterGSTrainer(GuiTrainer):
         # calculate loss
         # compose gt with background color if needed  # FIXME: integrate into data model
         rgb_gt = view.rgb
-        if (supervision_alpha := get_supervision_alpha(view)) is not None:
+        if supervision_alpha is not None:
             rgb_gt = apply_background_color(rgb_gt, supervision_alpha, bg_color)
         loss = self.loss(image, rgb_gt)
         # backward
