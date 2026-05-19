@@ -433,6 +433,23 @@ class Gaussians(torch.nn.Module):
         self._opacities = torch.nn.Parameter(torch.from_numpy(opacities).cuda().contiguous())
 
     @torch.no_grad()
+    def reset_spherical_harmonics_to_rgb(self, rgb: torch.Tensor) -> None:
+        """
+        Replace all SH with a view-neutral appearance: degree-0 from linear RGB in [0, 1], higher degrees zero.
+
+        Matches initialize_from_point_cloud: sh0 = (rgb - 0.5) / SH_C0 per channel.
+        """
+        if self._sh_coefficients_0 is None or self._sh_coefficients_rest is None:
+            return
+        rgb = rgb.flatten().to(dtype=torch.float32, device=self._sh_coefficients_0.device).clamp(0.0, 1.0)
+        if rgb.numel() != 3:
+            raise Framework.ModelError(f'reset_spherical_harmonics_to_rgb expects RGB of length 3, got shape {tuple(rgb.shape)}')
+        n = self._sh_coefficients_0.shape[0]
+        sh0 = ((rgb - 0.5) / _SH_C0).view(1, 1, 3).expand(n, 1, 3).contiguous()
+        self._sh_coefficients_0.data.copy_(sh0)
+        self._sh_coefficients_rest.data.zero_()
+
+    @torch.no_grad()
     def apply_scene_alignment_transform(self, transform: np.ndarray) -> None:
         """
         Apply the same rigid + optional uniform scale as dataset PCA (see BasicPointCloud.transform).
@@ -805,7 +822,7 @@ class FasterGSModel(BaseModel):
             return data
 
         # add method-specific comments
-        splat_render_mode = 'mip-0.1' if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
+        splat_render_mode = 'default' #'mip-0.1' if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
         data['comments'] = [f'SplatRenderMode: {splat_render_mode}', 'Generated with NeRFICG/FasterGS']
 
         return data

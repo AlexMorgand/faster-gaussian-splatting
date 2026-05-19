@@ -42,6 +42,8 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
     RANDOM_BACKGROUND_IF_ALPHA_OR_MASK=True,  # when alpha/mask is available, composite GT and render on same random color
     INITIALIZATION_GAUSSIAN_PLY_PATH=None,  # optional Gaussian PLY initialization (e.g. Mesh2Splat output)
+    # If set to [r, g, b] in [0, 1], replaces all SH from the PLY with this view-neutral color (DC only, rest zero).
+    INITIALIZATION_GAUSSIAN_PLY_DEFAULT_RGB=None,
     FREEZE_INITIAL_GAUSSIAN_GEOMETRY=True,  # when using INITIALIZATION_GAUSSIAN_PLY_PATH, freeze means/scales/rotations
     KEEP_THIN_SPLATS=True,  # when using INITIALIZATION_GAUSSIAN_PLY_PATH, avoid opacity resets that remove very thin details
     ENABLE_DENSIFICATION_WITH_GAUSSIAN_PLY_INIT=False,  # default off to preserve initialization geometry
@@ -51,6 +53,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     MIN_OPACITY_AFTER_TRAINING=1 / 255,
     RANDOM_INITIALIZATION=Framework.ConfigParameterList(
         FORCE=False,  # if True, the point cloud from the dataset will be ignored
+        IGNORE_GAUSSIAN_PLY=False,  # if True, skip INITIALIZATION_GAUSSIAN_PLY_PATH and use point cloud or random AABB init
         N_POINTS=100_000,  # number of random points to be sampled within the scene bounding box
         ENABLE_CARVING=True,  # removes points that are never in-frustum in any training view
         CARVING_IN_ALL_FRUSTUMS=False,  # removes points not in-frustum in all views
@@ -98,16 +101,34 @@ class FasterGSTrainer(GuiTrainer):
     def setup_gaussians(self, _, dataset: 'BaseDataset') -> None:
         """Sets up the model."""
         dataset.train()
+        self._gaussian_ply_init_active = False
         camera_centers = torch.stack([view.position for view in dataset])
         radius = (1.1 * torch.max(torch.linalg.norm(camera_centers - torch.mean(camera_centers, dim=0), dim=1))).item()
         Logger.log_info(f'training cameras extent: {radius:.2f}')
 
         ply_path = self.INITIALIZATION_GAUSSIAN_PLY_PATH
-        if ply_path not in (None, ''):
+        use_ply = ply_path not in (None, '') and not self.RANDOM_INITIALIZATION.IGNORE_GAUSSIAN_PLY
+        if self.RANDOM_INITIALIZATION.IGNORE_GAUSSIAN_PLY and ply_path not in (None, ''):
+            Logger.log_info(
+                'RANDOM_INITIALIZATION.IGNORE_GAUSSIAN_PLY: skipping INITIALIZATION_GAUSSIAN_PLY_PATH; '
+                'using COLMAP point cloud or random AABB initialization'
+            )
+
+        if use_ply:
             self.model.gaussians.initialize_from_gaussian_ply(str(Path(ply_path).expanduser()))
             self._gaussian_ply_init_active = True
             if getattr(dataset, 'scene_alignment_transform', None) is not None:
                 self.model.gaussians.apply_scene_alignment_transform(dataset.scene_alignment_transform)
+            default_rgb = self.INITIALIZATION_GAUSSIAN_PLY_DEFAULT_RGB
+            if default_rgb is not None:
+                rgb_list = list(default_rgb) if isinstance(default_rgb, (list, tuple)) else [default_rgb]
+                if len(rgb_list) != 3:
+                    raise Framework.TrainingError(
+                        f'INITIALIZATION_GAUSSIAN_PLY_DEFAULT_RGB must have length 3, got {default_rgb!r}'
+                    )
+                rgb_t = torch.tensor([float(rgb_list[0]), float(rgb_list[1]), float(rgb_list[2])], dtype=torch.float32)
+                self.model.gaussians.reset_spherical_harmonics_to_rgb(rgb_t)
+                Logger.log_info(f'reset PLY-init SH to default RGB {rgb_list}')
         elif dataset.point_cloud is not None and not self.RANDOM_INITIALIZATION.FORCE:
             point_cloud = dataset.point_cloud
             self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
@@ -118,6 +139,10 @@ class FasterGSTrainer(GuiTrainer):
                 positions = carve(positions, dataset, self.RANDOM_INITIALIZATION.CARVING_IN_ALL_FRUSTUMS, self.RANDOM_INITIALIZATION.CARVING_ENFORCE_ALPHA)
             point_cloud = BasicPointCloud(positions)
             self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
+            Logger.log_info(
+                f'random AABB Gaussian initialization: {self.RANDOM_INITIALIZATION.N_POINTS:,} points '
+                f'(carving={self.RANDOM_INITIALIZATION.ENABLE_CARVING})'
+            )
         self.model.gaussians.training_setup(self, radius, freeze_geometry=self._gaussian_ply_init_active and self.FREEZE_INITIAL_GAUSSIAN_GEOMETRY)
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info()
