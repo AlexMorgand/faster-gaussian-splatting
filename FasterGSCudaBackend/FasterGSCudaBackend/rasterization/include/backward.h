@@ -15,6 +15,7 @@ namespace faster_gs::rasterization {
         const float3* sh_coefficients_rest,
         const float4* w2c,
         const float3* cam_position,
+        const float3* sh_rotation,
         const float3* bg_color,
         char* primitive_buffers_blob,
         char* tile_buffers_blob,

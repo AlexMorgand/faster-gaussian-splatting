@@ -20,6 +20,7 @@ void faster_gs::rasterization::inference(
     const float3* sh_coefficients_rest,
     const float4* w2c,
     const float3* cam_position,
+    const float3* sh_rotation,
     const float3* bg_color,
     float* image,
     const int n_primitives,
@@ -71,6 +72,7 @@ void faster_gs::rasterization::inference(
         sh_coefficients_rest,
         w2c,
         cam_position,
+        sh_rotation,
         primitive_buffers.depth_keys.Current(),
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.n_touched_tiles,
@@ -102,31 +104,33 @@ void faster_gs::rasterization::inference(
     int n_instances;
     cudaMemcpy(&n_instances, primitive_buffers.n_instances, sizeof(uint), cudaMemcpyDeviceToHost);
 
-    cub::DeviceRadixSort::SortPairs(
-        primitive_buffers.cub_workspace,
-        primitive_buffers.cub_workspace_size,
-        primitive_buffers.depth_keys,
-        primitive_buffers.primitive_indices,
-        n_visible_primitives
-    );
-    CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (depth)")
+    if (n_visible_primitives > 0) {
+        cub::DeviceRadixSort::SortPairs(
+            primitive_buffers.cub_workspace,
+            primitive_buffers.cub_workspace_size,
+            primitive_buffers.depth_keys,
+            primitive_buffers.primitive_indices,
+            n_visible_primitives
+        );
+        CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (depth)")
 
-    kernels::inference::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering>>>(
-        primitive_buffers.primitive_indices.Current(),
-        primitive_buffers.n_touched_tiles,
-        primitive_buffers.offset,
-        n_visible_primitives
-    );
-    CHECK_CUDA(config::debug, "apply_depth_ordering")
+        kernels::inference::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering>>>(
+            primitive_buffers.primitive_indices.Current(),
+            primitive_buffers.n_touched_tiles,
+            primitive_buffers.offset,
+            n_visible_primitives
+        );
+        CHECK_CUDA(config::debug, "apply_depth_ordering")
 
-    cub::DeviceScan::ExclusiveSum(
-        primitive_buffers.cub_workspace,
-        primitive_buffers.cub_workspace_size,
-        primitive_buffers.offset,
-        primitive_buffers.offset,
-        n_visible_primitives
-    );
-    CHECK_CUDA(config::debug, "cub::DeviceScan::ExclusiveSum (primitive_buffers.offset)")
+        cub::DeviceScan::ExclusiveSum(
+            primitive_buffers.cub_workspace,
+            primitive_buffers.cub_workspace_size,
+            primitive_buffers.offset,
+            primitive_buffers.offset,
+            n_visible_primitives
+        );
+        CHECK_CUDA(config::debug, "cub::DeviceScan::ExclusiveSum (primitive_buffers.offset)")
+    }
 
     // with 16x16 tiles, 16 bit keys are sufficient for up to 16M pixels, i.e., 4Kx4K images
     // beyond that, 32 bit keys are needed and for best performance, we template the remaining rasterization steps
@@ -173,28 +177,30 @@ void faster_gs::rasterization::rasterize(
     char* instance_buffers_blob = resize_instance_buffers(required<InstanceBuffers<KeyT>>(n_instances, end_bit));
     InstanceBuffers<KeyT> instance_buffers = InstanceBuffers<KeyT>::from_blob(instance_buffers_blob, n_instances, end_bit);
 
-    kernels::inference::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances>>>(
-        primitive_buffers.primitive_indices.Current(),
-        primitive_buffers.offset,
-        primitive_buffers.screen_bounds,
-        primitive_buffers.mean2d,
-        primitive_buffers.conic_opacity,
-        instance_buffers.keys.Current(),
-        instance_buffers.primitive_indices.Current(),
-        grid.x,
-        n_visible_primitives
-    );
-    CHECK_CUDA(config::debug, "create_instances")
+    if (n_visible_primitives > 0) {
+        kernels::inference::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances>>>(
+            primitive_buffers.primitive_indices.Current(),
+            primitive_buffers.offset,
+            primitive_buffers.screen_bounds,
+            primitive_buffers.mean2d,
+            primitive_buffers.conic_opacity,
+            instance_buffers.keys.Current(),
+            instance_buffers.primitive_indices.Current(),
+            grid.x,
+            n_visible_primitives
+        );
+        CHECK_CUDA(config::debug, "create_instances")
 
-    cub::DeviceRadixSort::SortPairs(
-        instance_buffers.cub_workspace,
-        instance_buffers.cub_workspace_size,
-        instance_buffers.keys,
-        instance_buffers.primitive_indices,
-        n_instances,
-        0, end_bit
-    );
-    CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (tile)")
+        cub::DeviceRadixSort::SortPairs(
+            instance_buffers.cub_workspace,
+            instance_buffers.cub_workspace_size,
+            instance_buffers.keys,
+            instance_buffers.primitive_indices,
+            n_instances,
+            0, end_bit
+        );
+        CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (tile)")
+    }
 
     if constexpr (!config::debug) cudaStreamSynchronize(memset_stream);
 

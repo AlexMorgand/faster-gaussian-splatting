@@ -20,6 +20,7 @@ faster_gs::rasterization::forward_wrapper(
     const torch::Tensor& sh_coefficients_rest,
     const torch::Tensor& w2c,
     const torch::Tensor& cam_position,
+    const torch::Tensor& sh_rotation,
     const torch::Tensor& bg_color,
     const int active_sh_bases,
     const int width,
@@ -39,6 +40,7 @@ faster_gs::rasterization::forward_wrapper(
     CHECK_INPUT(config::debug, opacities, "opacities");
     CHECK_INPUT(config::debug, sh_coefficients_0, "sh_coefficients_0");
     CHECK_INPUT(config::debug, sh_coefficients_rest, "sh_coefficients_rest");
+    CHECK_INPUT(config::debug, sh_rotation, "sh_rotation");
 
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
@@ -67,6 +69,7 @@ faster_gs::rasterization::forward_wrapper(
         reinterpret_cast<float3*>(sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float4*>(w2c.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
+        reinterpret_cast<float3*>(sh_rotation.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
         n_primitives,
@@ -106,6 +109,7 @@ faster_gs::rasterization::backward_wrapper(
     const torch::Tensor& bucket_buffers,
     const torch::Tensor& w2c,
     const torch::Tensor& cam_position,
+    const torch::Tensor& sh_rotation,
     const torch::Tensor& bg_color,
     const int active_sh_bases,
     const int width,
@@ -145,6 +149,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float3*>(sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float4*>(w2c.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
+        reinterpret_cast<float3*>(sh_rotation.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         reinterpret_cast<char*>(primitive_buffers.data_ptr()),
         reinterpret_cast<char*>(tile_buffers.data_ptr()),
@@ -187,6 +192,7 @@ faster_gs::rasterization::inference_wrapper(
     const torch::Tensor& sh_coefficients_rest,
     const torch::Tensor& w2c,
     const torch::Tensor& cam_position,
+    const torch::Tensor& sh_rotation,
     const torch::Tensor& bg_color,
     const int active_sh_bases,
     const int width,
@@ -225,6 +231,7 @@ faster_gs::rasterization::inference_wrapper(
         reinterpret_cast<float3*>(sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float4*>(w2c.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
+        reinterpret_cast<float3*>(sh_rotation.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
         n_primitives,
@@ -257,6 +264,7 @@ faster_gs::rasterization::pruning_scores_wrapper(
     const torch::Tensor& sh_coefficients_rest,
     const torch::Tensor& w2c,
     const torch::Tensor& cam_position,
+    const torch::Tensor& sh_rotation,
     const torch::Tensor& bg_color,
     const int active_sh_bases,
     const int width,
@@ -291,6 +299,7 @@ faster_gs::rasterization::pruning_scores_wrapper(
         reinterpret_cast<float3*>(sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float4*>(w2c.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
+        reinterpret_cast<float3*>(sh_rotation.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         scores.data_ptr<float>(),
         n_primitives,

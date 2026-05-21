@@ -20,6 +20,7 @@ void faster_gs::rasterization::pruning_scores(
     const float3* sh_coefficients_rest,
     const float4* w2c,
     const float3* cam_position,
+    const float3* sh_rotation,
     const float3* bg_color,
     float* scores,
     const int n_primitives,
@@ -69,6 +70,7 @@ void faster_gs::rasterization::pruning_scores(
         sh_coefficients_rest,
         w2c,
         cam_position,
+        sh_rotation,
         primitive_buffers.depth_keys.Current(),
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.n_touched_tiles,
@@ -99,6 +101,10 @@ void faster_gs::rasterization::pruning_scores(
     cudaMemcpy(&n_visible_primitives, primitive_buffers.n_visible_primitives, sizeof(uint), cudaMemcpyDeviceToHost);
     int n_instances;
     cudaMemcpy(&n_instances, primitive_buffers.n_instances, sizeof(uint), cudaMemcpyDeviceToHost);
+
+    if (n_visible_primitives == 0) {
+        return;
+    }
 
     cub::DeviceRadixSort::SortPairs(
         primitive_buffers.cub_workspace,

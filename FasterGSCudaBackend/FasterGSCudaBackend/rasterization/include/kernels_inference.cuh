@@ -20,6 +20,7 @@ namespace faster_gs::rasterization::kernels::inference {
         const float3* __restrict__ sh_coefficients_rest,
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
+        const float3* __restrict__ sh_rotation,
         uint* __restrict__ primitive_depth_keys,
         uint* __restrict__ primitive_indices,
         uint* __restrict__ primitive_n_touched_tiles,
@@ -195,7 +196,7 @@ namespace faster_gs::rasterization::kernels::inference {
         primitive_conic_opacity[primitive_idx] = make_float4(conic, opacity);
         const float3 color = convert_sh_to_color(
             sh_coefficients_0, sh_coefficients_rest,
-            mean3d, cam_position[0],
+            mean3d, cam_position[0], sh_rotation,
             primitive_idx, active_sh_bases, total_sh_bases
         );
         primitive_color[primitive_idx] = fmaxf(color, 0.0f);

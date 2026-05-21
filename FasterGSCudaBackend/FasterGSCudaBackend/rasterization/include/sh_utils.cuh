@@ -29,11 +29,41 @@ namespace faster_gs::rasterization::kernels {
     DEF C3k = 5.597644988851731f;
     #undef DEF
 
+    __device__ inline float3 apply_sh_rotation(
+        const float3& v,
+        const float3* __restrict__ sh_rotation)
+    {
+        return make_float3(
+            dot(sh_rotation[0], v),
+            dot(sh_rotation[1], v),
+            dot(sh_rotation[2], v)
+        );
+    }
+
+    __device__ inline float3 apply_sh_rotation_transpose(
+        const float3& v,
+        const float3* __restrict__ sh_rotation)
+    {
+        return make_float3(
+            sh_rotation[0].x * v.x + sh_rotation[1].x * v.y + sh_rotation[2].x * v.z,
+            sh_rotation[0].y * v.x + sh_rotation[1].y * v.y + sh_rotation[2].y * v.z,
+            sh_rotation[0].z * v.x + sh_rotation[1].z * v.y + sh_rotation[2].z * v.z
+        );
+    }
+
+    __device__ inline float3 safe_normalize_sh_direction(const float3& v)
+    {
+        const float norm_sq = dot(v, v);
+        if (!isfinite(norm_sq) || norm_sq < 1e-12f) return make_float3(0.0f, 0.0f, 1.0f);
+        return v * rsqrtf(norm_sq);
+    }
+
     __device__ inline float3 convert_sh_to_color(
         const float3* __restrict__ sh_coefficients_0,
         const float3* __restrict__ sh_coefficients_rest,
         const float3& position,
         const float3& cam_position,
+        const float3* __restrict__ sh_rotation,
         const uint primitive_idx,
         const uint active_sh_bases,
         const uint total_sh_bases_rest)
@@ -42,7 +72,7 @@ namespace faster_gs::rasterization::kernels {
         float3 result = 0.5f + C0 * sh_coefficients_0[primitive_idx];
         if (active_sh_bases > 1) {
             const float3* coefficients_ptr = sh_coefficients_rest + primitive_idx * total_sh_bases_rest;
-            auto [x, y, z] = normalize(position - cam_position);
+            auto [x, y, z] = safe_normalize_sh_direction(apply_sh_rotation(position - cam_position, sh_rotation));
             result = result - C1 * y * coefficients_ptr[0]
                             + C1 * z * coefficients_ptr[1]
                             - C1 * x * coefficients_ptr[2];
@@ -74,6 +104,7 @@ namespace faster_gs::rasterization::kernels {
         float3* __restrict__ grad_sh_coefficients_rest,
         const float3& position,
         const float3& cam_position,
+        const float3* __restrict__ sh_rotation,
         const uint primitive_idx,
         const uint active_sh_bases,
         const uint total_sh_bases_rest)
@@ -87,7 +118,15 @@ namespace faster_gs::rasterization::kernels {
         float3 dcolor_dposition = make_float3(0.0f);
         if (active_sh_bases > 1) {
             auto [x_raw, y_raw, z_raw] = position - cam_position;
-            auto [x, y, z] = normalize(make_float3(x_raw, y_raw, z_raw));
+            const float3 direction_raw = make_float3(x_raw, y_raw, z_raw);
+            const float norm_sq_raw = dot(direction_raw, direction_raw);
+            if (!isfinite(norm_sq_raw) || norm_sq_raw < 1e-12f) {
+                grad_sh_coefficients_rest[primitive_idx * total_sh_bases_rest + 0] = make_float3(0.0f);
+                grad_sh_coefficients_rest[primitive_idx * total_sh_bases_rest + 1] = make_float3(0.0f);
+                grad_sh_coefficients_rest[primitive_idx * total_sh_bases_rest + 2] = make_float3(0.0f);
+                return dcolor_dposition;
+            }
+            auto [x, y, z] = safe_normalize_sh_direction(apply_sh_rotation(direction_raw, sh_rotation));
             grad_coefficients_ptr[0] = -C1 * y * grad_color;
             grad_coefficients_ptr[1] = C1 * z * grad_color;
             grad_coefficients_ptr[2] = -C1 * x * grad_color;
@@ -142,14 +181,14 @@ namespace faster_gs::rasterization::kernels {
                 dot(grad_direction_y, grad_color),
                 dot(grad_direction_z, grad_color)
             );
+            const float3 grad_direction_raw = apply_sh_rotation_transpose(grad_direction, sh_rotation);
             const float xx_raw = x_raw * x_raw, yy_raw = y_raw * y_raw, zz_raw = z_raw * z_raw;
             const float xy_raw = x_raw * y_raw, xz_raw = x_raw * z_raw, yz_raw = y_raw * z_raw;
-            const float norm_sq = xx_raw + yy_raw + zz_raw;
             dcolor_dposition = make_float3(
-                (yy_raw + zz_raw) * grad_direction.x - xy_raw * grad_direction.y - xz_raw * grad_direction.z,
-                -xy_raw * grad_direction.x + (xx_raw + zz_raw) * grad_direction.y - yz_raw * grad_direction.z,
-                -xz_raw * grad_direction.x - yz_raw * grad_direction.y + (xx_raw + yy_raw) * grad_direction.z
-            ) * rsqrtf(norm_sq * norm_sq * norm_sq);
+                (yy_raw + zz_raw) * grad_direction_raw.x - xy_raw * grad_direction_raw.y - xz_raw * grad_direction_raw.z,
+                -xy_raw * grad_direction_raw.x + (xx_raw + zz_raw) * grad_direction_raw.y - yz_raw * grad_direction_raw.z,
+                -xz_raw * grad_direction_raw.x - yz_raw * grad_direction_raw.y + (xx_raw + yy_raw) * grad_direction_raw.z
+            ) * rsqrtf(norm_sq_raw * norm_sq_raw * norm_sq_raw);
         }
         return dcolor_dposition;
     }

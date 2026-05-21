@@ -523,6 +523,9 @@ class Gaussians(torch.nn.Module):
     def prune(self, prune_mask: torch.Tensor) -> None:
         """Prunes Gaussians that are not visible or too large."""
         valid_mask = ~prune_mask
+        if not torch.any(valid_mask):
+            Logger.log_warning('pruning would remove all Gaussians; skipping prune step')
+            return
         param_groups = prune_param_groups(self.optimizer, valid_mask)
 
         self._means = param_groups['means']

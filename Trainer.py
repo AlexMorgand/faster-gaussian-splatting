@@ -13,6 +13,14 @@ from Methods.FasterGS.utils import enable_expandable_segments, carve
 from Optim.Samplers.DatasetSamplers import DatasetSampler
 
 
+def _training_extent_camera_position(view) -> torch.Tensor:
+    """Use physical capture positions for turntable views, not the fixed render camera."""
+    original_c2w = view.exif.get('turntable_original_c2w')
+    if original_c2w is None:
+        return view.position
+    return torch.as_tensor(original_c2w[:3, 3], dtype=view.position.dtype, device=view.position.device)
+
+
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
     DENSIFICATION_START_ITERATION=600,  # while official code states 500, densification actually starts at 600 there
@@ -102,8 +110,14 @@ class FasterGSTrainer(GuiTrainer):
         """Sets up the model."""
         dataset.train()
         self._gaussian_ply_init_active = False
-        camera_centers = torch.stack([view.position for view in dataset])
+        camera_centers = torch.stack([_training_extent_camera_position(view) for view in dataset])
         radius = (1.1 * torch.max(torch.linalg.norm(camera_centers - torch.mean(camera_centers, dim=0), dim=1))).item()
+        if radius <= 1e-6:
+            bbox_radius = (0.5 * torch.linalg.norm(dataset.bounding_box.size)).item()
+            radius = max(bbox_radius, 1.0)
+            Logger.log_warning(
+                f'training camera extent was degenerate; using fallback extent {radius:.2f}'
+            )
         Logger.log_info(f'training cameras extent: {radius:.2f}')
 
         ply_path = self.INITIALIZATION_GAUSSIAN_PLY_PATH

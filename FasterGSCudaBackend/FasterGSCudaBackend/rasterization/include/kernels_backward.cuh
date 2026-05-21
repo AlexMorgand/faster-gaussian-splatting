@@ -20,6 +20,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const float3* __restrict__ sh_coefficients_rest,
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
+        const float3* __restrict__ sh_rotation,
         const uint* __restrict__ primitive_n_touched_tiles,
         const float2* __restrict__ grad_mean2d,
         const float* __restrict__ grad_conic,
@@ -50,7 +51,7 @@ namespace faster_gs::rasterization::kernels::backward {
         // sh evaluation backward
         const float3 dL_dmean3d_from_color = convert_sh_to_color_backward(
             sh_coefficients_rest, grad_sh_coefficients_0, grad_sh_coefficients_rest,
-            mean3d, cam_position[0], primitive_idx,
+            mean3d, cam_position[0], sh_rotation, primitive_idx,
             active_sh_bases, total_sh_bases
         );
 

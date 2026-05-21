@@ -15,6 +15,7 @@ void faster_gs::rasterization::backward(
     const float3* sh_coefficients_rest,
     const float4* w2c,
     const float3* cam_position,
+    const float3* sh_rotation,
     const float3* bg_color,
     char* primitive_buffers_blob,
     char* tile_buffers_blob,
@@ -80,15 +81,17 @@ void faster_gs::rasterization::backward(
         );
         CHECK_CUDA(config::debug, "blend_backward")
     };
-    if (end_bit <= 16) {
-        auto instance_buffers = InstanceBuffers<ushort>::from_blob(instance_buffers_blob, n_instances, end_bit);
-        instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
-        dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
-    }
-    else {
-        auto instance_buffers = InstanceBuffers<uint>::from_blob(instance_buffers_blob, n_instances, end_bit);
-        instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
-        dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
+    if (n_buckets > 0) {
+        if (end_bit <= 16) {
+            auto instance_buffers = InstanceBuffers<ushort>::from_blob(instance_buffers_blob, n_instances, end_bit);
+            instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
+            dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
+        }
+        else {
+            auto instance_buffers = InstanceBuffers<uint>::from_blob(instance_buffers_blob, n_instances, end_bit);
+            instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
+            dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
+        }
     }
 
     kernels::backward::preprocess_backward_cu<<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward>>>(
@@ -99,6 +102,7 @@ void faster_gs::rasterization::backward(
         sh_coefficients_rest,
         w2c,
         cam_position,
+        sh_rotation,
         primitive_buffers.n_touched_tiles,
         grad_mean2d_helper,
         grad_conic_helper,

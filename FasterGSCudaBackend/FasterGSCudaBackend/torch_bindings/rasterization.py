@@ -8,6 +8,7 @@ from FasterGSCudaBackend import _C
 class RasterizerSettings(NamedTuple):
     w2c: torch.Tensor  # affine transformation from model/world space to view space
     cam_position: torch.Tensor  # camera position in world space
+    sh_rotation: torch.Tensor  # 3x3 matrix applied to SH query directions
     bg_color: torch.Tensor  # background color in RGB format
     active_sh_bases: int  # number of spherical harmonics bases to use for color computation
     width: int  # width of the image plane in pixels
@@ -24,6 +25,7 @@ class RasterizerSettings(NamedTuple):
         return (
             self.w2c,
             self.cam_position,
+            self.sh_rotation,
             self.bg_color,
             self.active_sh_bases,
             self.width,
