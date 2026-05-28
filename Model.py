@@ -13,7 +13,7 @@ from Datasets.Base import BaseDataset
 from Datasets.utils import BasicPointCloud
 from Logging import Logger
 from Methods.Base.Model import BaseModel
-from Cameras.utils import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion
+from Cameras.utils import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion, invert_3d_affine
 from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, relocation_adjustment, add_noise
 from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
@@ -317,9 +317,19 @@ class Gaussians(torch.nn.Module):
                 raise Framework.ModelError('update3dfilter only supports perspective cameras')
             if view.camera.distortion is not None:
                 Logger.log_warning('update3dfilter ignores all distortion parameters')
+            view_w2c = view.w2c
+            # In turntable mode the dataset c2w is fixed; use original capture cameras
+            # for visibility-derived filtering to avoid over/under-smoothing artifacts.
+            original_c2w = view.exif.get('turntable_original_c2w')
+            if original_c2w is not None:
+                original_w2c = view.exif.get('turntable_original_w2c')
+                if original_w2c is None:
+                    original_w2c = invert_3d_affine(original_c2w)
+                    view.exif['turntable_original_w2c'] = original_w2c
+                view_w2c = torch.as_tensor(original_w2c, dtype=positions.dtype, device=positions.device)
             update_3d_filter(
                 positions,
-                view.w2c,
+                view_w2c,
                 filter_3d,
                 visibility_mask,
                 view.camera.width,

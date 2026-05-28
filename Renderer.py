@@ -178,7 +178,7 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position),
-            to_chw=to_chw
+            to_chw=to_chw,
             clamp_output=self.model.ppisp is None,
         )
         if self.model.ppisp is not None:
