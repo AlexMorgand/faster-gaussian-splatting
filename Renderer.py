@@ -149,7 +149,12 @@ class FasterGSRenderer(BaseRenderer):
     @torch.no_grad()
     def render_image_inference(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
-        means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(view, self.model.gaussians.means, self.model.gaussians.raw_rotations)
+        means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
+            view,
+            self.model.gaussians.means,
+            self.model.gaussians.raw_rotations,
+            use_original_camera_fast_path=True,
+        )
         image = diff_rasterize(
             means=means,
             scales=self.model.gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
@@ -169,7 +174,12 @@ class FasterGSRenderer(BaseRenderer):
     @torch.inference_mode()
     def render_image_benchmark(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
-        means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(view, self.model.gaussians.means, self.model.gaussians.raw_rotations)
+        means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
+            view,
+            self.model.gaussians.means,
+            self.model.gaussians.raw_rotations,
+            use_original_camera_fast_path=True,
+        )
         image = rasterize(
             means=means,
             scales=self.model.gaussians.raw_scales,
