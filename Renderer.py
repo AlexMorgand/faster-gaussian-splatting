@@ -16,6 +16,9 @@ from Methods.FasterGS.Model import FasterGSModel
 from Methods.FasterGS.FasterGSCudaBackend import diff_rasterize, rasterize, update_pruning_scores, RasterizerSettings
 
 
+_SH_C0 = 0.28209479177387814
+
+
 def extract_settings(
     view: View,
     active_sh_bases: int,
@@ -170,6 +173,44 @@ class FasterGSRenderer(BaseRenderer):
         else:
             image = image.clamp(0.0, 1.0)
         return {'rgb': image if to_chw else image.permute(1, 2, 0)}
+
+    @torch.no_grad()
+    def render_alpha_inference(self, view: View, to_chw: bool = False) -> torch.Tensor:
+        """Renders accumulated Gaussian opacity as a single-channel alpha mask."""
+        means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
+            view,
+            self.model.gaussians.means,
+            self.model.gaussians.raw_rotations,
+            use_original_camera_fast_path=True,
+        )
+        n_gaussians = self.model.gaussians.means.shape[0]
+        white_sh0 = torch.full(
+            (n_gaussians, 1, 3),
+            fill_value=0.5 / _SH_C0,
+            dtype=self.model.gaussians.sh_coefficients_0.dtype,
+            device=self.model.gaussians.sh_coefficients_0.device,
+        )
+        zero_sh_rest = torch.zeros_like(self.model.gaussians.sh_coefficients_rest)
+        alpha_rgb = diff_rasterize(
+            means=means,
+            scales=self.model.gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
+            rotations=rotations,
+            opacities=self.model.gaussians.raw_opacities,
+            sh_coefficients_0=white_sh0,
+            sh_coefficients_rest=zero_sh_rest,
+            densification_info=torch.empty(0, device=means.device),
+            rasterizer_settings=extract_settings(
+                view,
+                1,
+                torch.zeros_like(view.camera.background_color),
+                self.PROPER_ANTIALIASING,
+                sh_rotation,
+                w2c,
+                cam_position,
+            ),
+        ).clamp(0.0, 1.0)
+        alpha = alpha_rgb.mean(dim=0, keepdim=True)
+        return alpha if to_chw else alpha.permute(1, 2, 0)
 
     @torch.inference_mode()
     def render_image_benchmark(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
