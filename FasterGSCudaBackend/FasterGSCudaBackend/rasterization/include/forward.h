@@ -34,7 +34,11 @@ namespace faster_gs::rasterization {
         const float center_y,
         const float near_plane,
         const float far_plane,
-        const bool proper_antialiasing);
+        const bool proper_antialiasing,
+        // deferred-reflection extension: when features != nullptr the blend also
+        // composits a per-Gaussian feature vector (normal.xyz + refl) into feature_map
+        const float4* features = nullptr,
+        float* feature_map = nullptr);
 
     template <typename KeyT>
     void diff_rasterize(
@@ -46,6 +50,28 @@ namespace faster_gs::rasterization {
         const dim3& block,
         const float3* bg_color,
         float* image,
+        const cudaStream_t memset_stream,
+        const int n_visible_primitives,
+        const int n_instances,
+        const int n_tiles,
+        const int end_bit,
+        const int width,
+        const int height,
+        int& n_buckets,
+        int& instance_primitive_indices_selector);
+
+    template <typename KeyT>
+    void diff_rasterize_dr(
+        std::function<char* (size_t)>& resize_instance_buffers,
+        std::function<char* (size_t)>& resize_bucket_buffers,
+        PrimitiveBuffers& primitive_buffers,
+        TileBuffers& tile_buffers,
+        const dim3& grid,
+        const dim3& block,
+        const float3* bg_color,
+        const float4* features,
+        float* image,
+        float* feature_map,
         const cudaStream_t memset_stream,
         const int n_visible_primitives,
         const int n_instances,

@@ -13,7 +13,8 @@ from Logging import Logger
 from Methods.Base.Renderer import BaseModel
 from Methods.Base.Renderer import BaseRenderer
 from Methods.FasterGS.Model import FasterGSModel
-from Methods.FasterGS.FasterGSCudaBackend import diff_rasterize, rasterize, update_pruning_scores, RasterizerSettings
+from Methods.FasterGS.FasterGSCudaBackend import diff_rasterize, diff_rasterize_dr, rasterize, update_pruning_scores, RasterizerSettings
+from Methods.FasterGS.DeferredShading import compose_deferred
 
 
 def extract_settings(
@@ -124,6 +125,13 @@ class FasterGSRenderer(BaseRenderer):
         else:
             return self.render_image_inference(view, to_chw)
 
+    def _deferred_features(self, view: View, cam_position: torch.Tensor | None) -> torch.Tensor:
+        """Per-Gaussian deferred-reflection feature tensor (N, 4) = (normal.xyz, refl strength)."""
+        camera_position = cam_position if cam_position is not None else view.position
+        normals = self.model.gaussians.min_axis_normals(camera_position)  # (N, 3), world space
+        refl = self.model.gaussians.reflection_strength  # (N, 1)
+        return torch.cat([normals, refl], dim=1).contiguous()
+
     def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> torch.Tensor:
         """Renders an image for a given view."""
         means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
@@ -132,16 +140,32 @@ class FasterGSRenderer(BaseRenderer):
             self.model.gaussians.raw_rotations,
             use_original_camera_fast_path=True,
         )
-        image = diff_rasterize(
-            means=means,
-            scales=self.model.gaussians.raw_scales,
-            rotations=rotations,
-            opacities=self.model.gaussians.raw_opacities,
-            sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
-            sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-            densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position),
-        )
+        settings = extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position)
+        if self.model.gaussians.deferred_reflection:
+            features = self._deferred_features(view, cam_position)
+            base_image, feature_map = diff_rasterize_dr(
+                means=means,
+                scales=self.model.gaussians.raw_scales,
+                rotations=rotations,
+                opacities=self.model.gaussians.raw_opacities,
+                sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
+                sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
+                features=features,
+                densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
+                rasterizer_settings=settings,
+            )
+            image = compose_deferred(base_image, feature_map, view, self.model.environment)['rgb']
+        else:
+            image = diff_rasterize(
+                means=means,
+                scales=self.model.gaussians.raw_scales,
+                rotations=rotations,
+                opacities=self.model.gaussians.raw_opacities,
+                sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
+                sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
+                densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
+                rasterizer_settings=settings,
+            )
         if self.model.ppisp is not None:
             image = self.model.ppisp(image, view)
         return image
@@ -155,25 +179,61 @@ class FasterGSRenderer(BaseRenderer):
             self.model.gaussians.raw_rotations,
             use_original_camera_fast_path=True,
         )
-        image = diff_rasterize(
-            means=means,
-            scales=self.model.gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
-            rotations=rotations,
-            opacities=self.model.gaussians.raw_opacities,
-            sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
-            sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-            densification_info=torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position),
-        )
+        settings = extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position)
+        scales = self.model.gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6))
+        decomposition = None
+        if self.model.gaussians.deferred_reflection:
+            features = self._deferred_features(view, cam_position)
+            base_image, feature_map = diff_rasterize_dr(
+                means=means,
+                scales=scales,
+                rotations=rotations,
+                opacities=self.model.gaussians.raw_opacities,
+                sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
+                sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
+                features=features,
+                densification_info=torch.empty(0),
+                rasterizer_settings=settings,
+            )
+            decomposition = compose_deferred(base_image, feature_map, view, self.model.environment)
+            image = decomposition['rgb']
+        else:
+            image = diff_rasterize(
+                means=means,
+                scales=scales,
+                rotations=rotations,
+                opacities=self.model.gaussians.raw_opacities,
+                sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
+                sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
+                densification_info=torch.empty(0),
+                rasterizer_settings=settings,
+            )
         if self.model.ppisp is not None:
             image = self.model.ppisp(image, view)
         else:
             image = image.clamp(0.0, 1.0)
-        return {'rgb': image if to_chw else image.permute(1, 2, 0)}
+
+        def _to_display(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor if to_chw else tensor.permute(1, 2, 0)
+
+        outputs = {'rgb': _to_display(image)}
+        # expose the deferred-reflection decomposition so ICGui's output-mode picker
+        # can show base color / reflection color / reflection strength / normal
+        if decomposition is not None:
+            outputs['base_color'] = _to_display(decomposition['base_color'].clamp(0.0, 1.0))
+            outputs['reflection_color'] = _to_display(decomposition['reflection_color'].clamp(0.0, 1.0))
+            outputs['reflection_strength'] = _to_display(decomposition['reflection_strength'].clamp(0.0, 1.0))
+            outputs['normal'] = _to_display((decomposition['normal'] * 0.5 + 0.5).clamp(0.0, 1.0))
+        return outputs
 
     @torch.inference_mode()
     def render_image_benchmark(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
+        # the optimized inference rasterizer has no deferred-reflection path; fall back to
+        # the DR inference renderer so reflections are never silently dropped in the GUI
+        if self.model.gaussians.deferred_reflection:
+            with torch.no_grad():
+                return self.render_image_inference(view, to_chw=to_chw)
         means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
             view,
             self.model.gaussians.means,

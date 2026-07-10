@@ -11,10 +11,14 @@ __install_command__ = [
 ]
 
 try:
-    from .FasterGSCudaBackend.torch_bindings.rasterization import diff_rasterize, rasterize, update_pruning_scores, RasterizerSettings
+    from .FasterGSCudaBackend.torch_bindings.rasterization import diff_rasterize, diff_rasterize_dr, rasterize, update_pruning_scores, RasterizerSettings
+    from .FasterGSCudaBackend.torch_bindings.cubemap_encoder import CubemapEncoder
     from .FasterGSCudaBackend.torch_bindings.adam import FusedAdam
     from .FasterGSCudaBackend.torch_bindings.filter3d import update_3d_filter
     from .FasterGSCudaBackend.torch_bindings.densification import relocation_adjustment, add_noise
-    __all__ = ['diff_rasterize', 'rasterize', 'update_pruning_scores', 'RasterizerSettings', 'FusedAdam', 'update_3d_filter', 'relocation_adjustment', 'add_noise']
+    __all__ = [
+        'diff_rasterize', 'diff_rasterize_dr', 'rasterize', 'update_pruning_scores', 'RasterizerSettings',
+        'CubemapEncoder', 'FusedAdam', 'update_3d_filter', 'relocation_adjustment', 'add_noise',
+    ]
 except ImportError as e:
     raise Framework.ExtensionError(name=__extension_name__, install_command=__install_command__)

@@ -42,6 +42,12 @@ namespace faster_gs::rasterization {
         const float focal_y,
         const float center_x,
         const float center_y,
-        const bool proper_antialiasing);
+        const bool proper_antialiasing,
+        // deferred-reflection extension: when features != nullptr the blend backward
+        // also propagates grad_feature_map to grad_features and to Gaussian geometry
+        const float4* features = nullptr,
+        const float* grad_feature_map = nullptr,
+        const float* feature_map = nullptr,
+        float4* grad_features = nullptr);
 
 }

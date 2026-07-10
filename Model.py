@@ -28,17 +28,22 @@ _SH_C0 = 0.28209479177387814
 class Gaussians(torch.nn.Module):
     """Stores a set of 3D Gaussians."""
 
-    def __init__(self, sh_degree: int, pretrained: bool) -> None:
+    def __init__(self, sh_degree: int, pretrained: bool, deferred_reflection: bool = False, refl_init_value: float = 1e-3) -> None:
         super().__init__()
         self.active_sh_degree = sh_degree if pretrained else 0
         self.active_sh_bases = (self.active_sh_degree + 1) ** 2
         self.max_sh_degree = sh_degree
+        # deferred reflection (3DGS-DR): per-Gaussian scalar reflection strength.
+        # Gated so the base FasterGS path is unaffected when disabled.
+        self.deferred_reflection = deferred_reflection
+        self.refl_init_value = float(refl_init_value)
         self.register_parameter('_means', None)
         self.register_parameter('_sh_coefficients_0', None)
         self.register_parameter('_sh_coefficients_rest', None)
         self.register_parameter('_scales', None)
         self.register_parameter('_rotations', None)
         self.register_parameter('_opacities', None)
+        self.register_parameter('_reflection_strength', None)
         self._densification_info = None
         self.optimizer = None
         self.percent_dense = 0.0
@@ -274,6 +279,128 @@ class Gaussians(torch.nn.Module):
         RS = R @ S
         return RS @ RS.transpose(-2, -1)
 
+    @property
+    def reflection_strength(self) -> torch.Tensor:
+        """Returns the Gaussians' reflection strength in [0, 1] (N, 1)."""
+        return self._reflection_strength.sigmoid()
+
+    @property
+    def raw_reflection_strength(self) -> torch.Tensor:
+        """Returns the Gaussians' unactivated (logit) reflection strength (N, 1)."""
+        return self._reflection_strength
+
+    def _make_reflection_strength(self, n: int) -> torch.nn.Parameter:
+        """Creates an initial reflection-strength parameter (logit of refl_init_value)."""
+        v = min(max(self.refl_init_value, 1e-6), 1.0 - 1e-6)
+        logit = math.log(v / (1.0 - v))
+        values = torch.full((n, 1), fill_value=logit, dtype=torch.float32, device='cuda')
+        return torch.nn.Parameter(values.contiguous())
+
+    def min_axis_normals(self, camera_position: torch.Tensor) -> torch.Tensor:
+        """Per-Gaussian normal = shortest ellipsoid axis, flipped to face the camera (N, 3).
+
+        Matches 3DGS-DR ``get_min_axis``: unit axis from the rotation matrix, flipped
+        when it points away from the camera. **Not** normalized here — the rasterizer
+        blends raw normals and ``compose_deferred`` normalizes the per-pixel map before
+        reflection (critical for correct cubemap queries).
+        """
+        R = quaternion_to_rotation_matrix(self.rotations, normalize=False)  # (N, 3, 3), columns are axes
+        scales = self.scales  # (N, 3)
+        min_idx = scales.argmin(dim=1)  # (N,) shortest axis
+        n = R.shape[0]
+        normals = R[torch.arange(n, device=R.device), :, min_idx]  # (N, 3)
+        to_camera = camera_position.reshape(1, 3) - self._means  # (N, 3)
+        flip = (normals * to_camera).sum(dim=-1, keepdim=True) < 0.0
+        normals = torch.where(flip, -normals, normals)
+        return normals
+
+    @torch.no_grad()
+    def dr_reset_opacity_floor(self, floor: float = 0.01) -> None:
+        """3DGS-DR ``reset_opacity0``: clamp high opacities down to ``floor``."""
+        floor_logit = math.log(floor / (1.0 - floor))
+        below = self.opacities < floor
+        new_opacities = torch.where(below, self._opacities, torch.full_like(self._opacities, floor_logit))
+        replace_param_group_data(self.optimizer, new_opacities, 'opacities')
+        self._opacities = self._get_param('opacities')
+
+    @torch.no_grad()
+    def dr_reset_opacity_ceiling(self, ceiling: float = 0.9) -> None:
+        """3DGS-DR ``reset_opacity1``: raise low opacities up to ``ceiling``."""
+        ceil_logit = math.log(ceiling / (1.0 - ceiling))
+        above = self.opacities > ceiling
+        new_opacities = torch.where(above, self._opacities, torch.full_like(self._opacities, ceil_logit))
+        replace_param_group_data(self.optimizer, new_opacities, 'opacities')
+        self._opacities = self._get_param('opacities')
+
+    @torch.no_grad()
+    def dr_bump_reflection_strength(self, min_reflection: float = 1e-3) -> None:
+        """3DGS-DR ``reset_refl``: raise reflection strength to at least ``min_reflection``."""
+        if self._reflection_strength is None:
+            return
+        min_refl_logit = math.log(min_reflection / (1.0 - min_reflection))
+        new_reflection = torch.maximum(
+            self._reflection_strength,
+            torch.full_like(self._reflection_strength, min_refl_logit),
+        )
+        replace_param_group_data(self.optimizer, new_reflection, 'reflection_strength')
+        self._reflection_strength = self._get_param('reflection_strength')
+
+    @torch.no_grad()
+    def dr_enlarge_reflective_scales(
+        self,
+        refl_threshold: float = 0.02,
+        enlarge_scale: float = 1.5,
+    ) -> None:
+        """3DGS-DR ``reset_scale`` / ``enlarge_refl_scales``: scale the two longest axes."""
+        if self._reflection_strength is None:
+            return
+        reflective = self.reflection_strength.flatten() >= refl_threshold
+        if not reflective.any():
+            return
+        scales = self._scales  # logspace (N, 3)
+        min_idx = self.scales.argmin(dim=1)
+        enlarge = torch.full_like(scales, fill_value=math.log(enlarge_scale))
+        enlarge[torch.arange(scales.shape[0], device=scales.device), min_idx] = 0.0
+        enlarge[~reflective] = 0.0
+        new_scales = scales + enlarge
+        replace_param_group_data(self.optimizer, new_scales, 'scales')
+        self._scales = self._get_param('scales')
+
+    @torch.no_grad()
+    def normal_propagation(self, refl_threshold: float = 0.1, enlarge_scale: float = 1.5,
+                           min_opacity: float = 0.9, min_reflection: float = 1e-3) -> None:
+        """Legacy combined propagation step (opacity + reflection + scale). Prefer the
+        split ``dr_*`` helpers for 3DGS-DR parity."""
+        self.dr_reset_opacity_ceiling(min_opacity)
+        self.dr_bump_reflection_strength(min_reflection)
+        self.dr_enlarge_reflective_scales(refl_threshold=refl_threshold, enlarge_scale=enlarge_scale)
+
+    @torch.no_grad()
+    def color_sabotage(self, refl_threshold: float = 0.05, noise: float = 0.4) -> None:
+        """3DGS-DR ``dist_color``: perturb diffuse SH of non-reflective Gaussians."""
+        if self._reflection_strength is None:
+            return
+        non_reflective = self.reflection_strength.flatten() <= refl_threshold
+        if not non_reflective.any():
+            return
+        sh0 = self._sh_coefficients_0.clone()
+        perturb = (torch.rand_like(sh0) * 2.0 - 1.0) * noise
+        perturb[~non_reflective] = 0.0
+        replace_param_group_data(self.optimizer, sh0 + perturb, 'sh_coefficients_0')
+        self._sh_coefficients_0 = self._get_param('sh_coefficients_0')
+
+    def n_reflective(self, refl_threshold: float = 0.1) -> int:
+        """Number of Gaussians with reflection strength above the threshold."""
+        if self._reflection_strength is None:
+            return 0
+        return int((self.reflection_strength.flatten() > refl_threshold).sum().item())
+
+    def _get_param(self, name: str) -> torch.nn.Parameter:
+        for group in self.optimizer.param_groups:
+            if group['name'] == name:
+                return group['params'][0]
+        raise KeyError(name)
+
     def opacity_regularization_loss(self) -> torch.Tensor:
         """Encourages the Gaussians' opacities to be small."""
         return self.opacities.mean()
@@ -378,6 +505,8 @@ class Gaussians(torch.nn.Module):
         self._scales = torch.nn.Parameter(scales.contiguous())
         self._rotations = torch.nn.Parameter(rotations.contiguous())
         self._opacities = torch.nn.Parameter(opacities.contiguous())
+        if self.deferred_reflection:
+            self._reflection_strength = self._make_reflection_strength(n_initial_gaussians)
 
     def initialize_from_gaussian_ply(self, path: str) -> None:
         """Initializes the model from a Gaussian PLY with explicit Gaussian attributes."""
@@ -400,6 +529,8 @@ class Gaussians(torch.nn.Module):
             self._scales = torch.nn.Parameter(torch.from_numpy(scales).cuda().contiguous())
             self._rotations = torch.nn.Parameter(torch.from_numpy(rotations).cuda().contiguous())
             self._opacities = torch.nn.Parameter(torch.from_numpy(opacities).cuda().contiguous())
+            if self.deferred_reflection:
+                self._reflection_strength = self._make_reflection_strength(n_initial_gaussians)
             return
 
         vertices = plydata['vertex']
@@ -441,6 +572,8 @@ class Gaussians(torch.nn.Module):
         self._scales = torch.nn.Parameter(torch.from_numpy(scales).cuda().contiguous())
         self._rotations = torch.nn.Parameter(torch.from_numpy(rotations).cuda().contiguous())
         self._opacities = torch.nn.Parameter(torch.from_numpy(opacities).cuda().contiguous())
+        if self.deferred_reflection:
+            self._reflection_strength = self._make_reflection_strength(n_initial_gaussians)
 
     @torch.no_grad()
     def reset_spherical_harmonics_to_rgb(self, rgb: torch.Tensor) -> None:
@@ -496,6 +629,15 @@ class Gaussians(torch.nn.Module):
             {'params': [self._rotations], 'lr': 0.0 if freeze_geometry else training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'}
         ]
 
+        if self.deferred_reflection:
+            if self._reflection_strength is None:
+                self._reflection_strength = self._make_reflection_strength(self._means.shape[0])
+            param_groups.append({
+                'params': [self._reflection_strength],
+                'lr': getattr(training_wrapper.OPTIMIZER, 'LEARNING_RATE_REFLECTION_STRENGTH', 0.006),
+                'name': 'reflection_strength',
+            })
+
         self.optimizer = FusedAdam(param_groups, lr=0.0, eps=1e-15)
 
         if freeze_geometry:
@@ -544,6 +686,8 @@ class Gaussians(torch.nn.Module):
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        if 'reflection_strength' in param_groups:
+            self._reflection_strength = param_groups['reflection_strength']
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, valid_mask].contiguous()
@@ -560,6 +704,8 @@ class Gaussians(torch.nn.Module):
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        if 'reflection_strength' in param_groups:
+            self._reflection_strength = param_groups['reflection_strength']
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, ordering].contiguous()
@@ -583,6 +729,8 @@ class Gaussians(torch.nn.Module):
         duplicated_opacities = self._opacities[duplicate_mask]
         duplicated_scales = self._scales[duplicate_mask]
         duplicated_rotations = self._rotations[duplicate_mask]
+        if self._reflection_strength is not None:
+            duplicated_reflection = self._reflection_strength[duplicate_mask]
 
         # split large gaussians
         split_mask = densification_mask & ~is_small
@@ -595,23 +743,30 @@ class Gaussians(torch.nn.Module):
         split_sh_coefficients_0 = self._sh_coefficients_0[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
         split_sh_coefficients_rest = self._sh_coefficients_rest[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
         split_opacities = self._opacities[split_mask].expand(2, -1, -1).flatten(end_dim=1)
+        if self._reflection_strength is not None:
+            split_reflection = self._reflection_strength[split_mask].expand(2, -1, -1).flatten(end_dim=1)
 
         # incorporate
         n_new_gaussians = n_new_gaussians_duplicate + n_new_gaussians_split
-        param_groups = extend_param_groups(self.optimizer, {
+        extension = {
             'means': torch.cat([duplicated_means, split_means]),
             'sh_coefficients_0': torch.cat([duplicated_sh_coefficients_0, split_sh_coefficients_0]),
             'sh_coefficients_rest': torch.cat([duplicated_sh_coefficients_rest, split_sh_coefficients_rest]),
             'opacities': torch.cat([duplicated_opacities, split_opacities]),
             'scales': torch.cat([duplicated_scales, split_scales]),
             'rotations': torch.cat([duplicated_rotations, split_rotations])
-        })
+        }
+        if self._reflection_strength is not None:
+            extension['reflection_strength'] = torch.cat([duplicated_reflection, split_reflection])
+        param_groups = extend_param_groups(self.optimizer, extension)
         self._means = param_groups['means']
         self._sh_coefficients_0 = param_groups['sh_coefficients_0']
         self._sh_coefficients_rest = param_groups['sh_coefficients_rest']
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        if 'reflection_strength' in param_groups:
+            self._reflection_strength = param_groups['reflection_strength']
 
         # if they were set, densification info and 3d filter are now no longer valid
         self._densification_info = None
@@ -661,6 +816,8 @@ class Gaussians(torch.nn.Module):
             self._opacities[dead_indices] = adjusted_opacities
             self._scales[dead_indices] = adjusted_scales
             self._rotations[dead_indices] = self._rotations[sampled_indices]
+            if self._reflection_strength is not None:
+                self._reflection_strength[dead_indices] = self._reflection_strength[sampled_indices]
 
             # reset optimizer state for the sampled Gaussians
             reset_state(self.optimizer, indices=sampled_indices)
@@ -694,20 +851,25 @@ class Gaussians(torch.nn.Module):
             self._scales[sampled_indices] = adjusted_scales
 
             # add new Gaussians by duplicating the sampled ones
-            param_groups = extend_param_groups(self.optimizer, {
+            extension = {
                 'means': self._means[sampled_indices],
                 'sh_coefficients_0': self._sh_coefficients_0[sampled_indices],
                 'sh_coefficients_rest': self._sh_coefficients_rest[sampled_indices],
                 'opacities': adjusted_opacities,
                 'scales': adjusted_scales,
                 'rotations': self._rotations[sampled_indices],
-            })
+            }
+            if self._reflection_strength is not None:
+                extension['reflection_strength'] = self._reflection_strength[sampled_indices]
+            param_groups = extend_param_groups(self.optimizer, extension)
             self._means = param_groups['means']
             self._sh_coefficients_0 = param_groups['sh_coefficients_0']
             self._sh_coefficients_rest = param_groups['sh_coefficients_rest']
             self._opacities = param_groups['opacities']
             self._scales = param_groups['scales']
             self._rotations = param_groups['rotations']
+            if 'reflection_strength' in param_groups:
+                self._reflection_strength = param_groups['reflection_strength']
 
             # reset optimizer state for the sampled Gaussians
             reset_state(self.optimizer, indices=sampled_indices)
@@ -811,6 +973,11 @@ class Gaussians(torch.nn.Module):
         CONTROLLER_TRAINING_STEPS=5_000,
         CONTROLLER_DISTILLATION=True,
     ),
+    DEFERRED_REFLECTION=Framework.ConfigParameterList(
+        USE=False,
+        REFL_INIT_VALUE=1e-3,
+        ENVMAP_RESOLUTION=256,
+    ),
 )
 class FasterGSModel(BaseModel):
     """Defines the FasterGS model."""
@@ -819,11 +986,19 @@ class FasterGSModel(BaseModel):
         super().__init__(name)
         self.gaussians: Gaussians | None = None
         self.ppisp: PPISPWrapper | None = None
+        self.environment = None
 
     def build(self) -> 'FasterGSModel':
         """Builds the model."""
         pretrained = self.num_iterations_trained > 0
-        self.gaussians = Gaussians(self.SH_DEGREE, pretrained)
+        self.gaussians = Gaussians(
+            self.SH_DEGREE, pretrained,
+            deferred_reflection=self.DEFERRED_REFLECTION.USE,
+            refl_init_value=self.DEFERRED_REFLECTION.REFL_INIT_VALUE,
+        )
+        if self.DEFERRED_REFLECTION.USE:
+            from Methods.FasterGS.DeferredShading import EnvironmentMap
+            self.environment = EnvironmentMap(resolution=self.DEFERRED_REFLECTION.ENVMAP_RESOLUTION).cuda()
         if self.PPISP.USE:
             self.ppisp = PPISPWrapper(self.PPISP)
         return self

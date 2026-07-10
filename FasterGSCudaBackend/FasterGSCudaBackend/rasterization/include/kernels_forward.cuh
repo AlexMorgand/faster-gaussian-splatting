@@ -475,4 +475,117 @@ namespace faster_gs::rasterization::kernels::forward {
         if (thread_rank == 0) tile_max_n_processed[tile_idx] = n_processed_and_used;
     }
 
+    // Deferred-reflection blend: identical alpha compositing to blend_cu, but in
+    // addition to the SH color it blends a per-Gaussian feature vector
+    // (normal.xyz + reflection strength) with the same weights transmittance*alpha
+    // and writes it to a 4-channel feature map. The feature accumulation is
+    // checkpointed per bucket (bucket_feature_accum) so the backward pass can
+    // restart it mid-tile exactly like the color channels. Features carry no
+    // background term.
+    __global__ void __launch_bounds__(config::block_size_blend) blend_dr_cu(
+        const uint2* __restrict__ tile_instance_ranges,
+        const uint* __restrict__ tile_buckets_offset,
+        const uint* __restrict__ instance_primitive_indices,
+        const float2* __restrict__ primitive_mean2d,
+        const float4* __restrict__ primitive_conic_opacity,
+        const float3* __restrict__ primitive_color,
+        const float4* __restrict__ primitive_feature,
+        const float3* __restrict__ bg_color,
+        float* __restrict__ image,
+        float* __restrict__ feature_map,
+        float* __restrict__ tile_final_transmittances,
+        uint* __restrict__ tile_max_n_processed,
+        uint* __restrict__ tile_n_processed,
+        uint* __restrict__ bucket_tile_index,
+        float4* __restrict__ bucket_color_transmittance,
+        float4* __restrict__ bucket_feature_accum,
+        const uint width,
+        const uint height,
+        const uint grid_width)
+    {
+        auto block = cg::this_thread_block();
+        const dim3 group_index = block.group_index();
+        const dim3 thread_index = block.thread_index();
+        const uint thread_rank = block.thread_rank();
+        const uint2 pixel_coords = make_uint2(group_index.x * config::tile_width + thread_index.x, group_index.y * config::tile_height + thread_index.y);
+        const bool inside = pixel_coords.x < width && pixel_coords.y < height;
+        const float2 pixel = make_float2(__uint2float_rn(pixel_coords.x), __uint2float_rn(pixel_coords.y)) + 0.5f;
+        const uint tile_idx = group_index.y * grid_width + group_index.x;
+        const uint2 tile_range = tile_instance_ranges[tile_idx];
+        const int n_points_total = tile_range.y - tile_range.x;
+        const int n_buckets = div_round_up(n_points_total, 32);
+        uint bucket_offset = (tile_idx == 0) ? 0 : tile_buckets_offset[tile_idx - 1];
+        for (int n_buckets_remaining = n_buckets, current_bucket_idx = thread_rank; n_buckets_remaining > 0; n_buckets_remaining -= config::block_size_blend, current_bucket_idx += config::block_size_blend) {
+            if (current_bucket_idx < n_buckets) bucket_tile_index[bucket_offset + current_bucket_idx] = tile_idx;
+        }
+        __shared__ float2 collected_mean2d[config::block_size_blend];
+        __shared__ float4 collected_conic_opacity[config::block_size_blend];
+        __shared__ float3 collected_color[config::block_size_blend];
+        __shared__ float4 collected_feature[config::block_size_blend];
+        float3 color_pixel = make_float3(0.0f);
+        float4 feature_pixel = make_float4(0.0f);
+        float transmittance = 1.0f;
+        uint n_processed = 0;
+        uint n_processed_and_used = 0;
+        bool done = !inside;
+        for (int n_points_remaining = n_points_total, current_fetch_idx = tile_range.x + thread_rank; n_points_remaining > 0; n_points_remaining -= config::block_size_blend, current_fetch_idx += config::block_size_blend) {
+            if (__syncthreads_count(done) == config::block_size_blend) break;
+            if (current_fetch_idx < tile_range.y) {
+                const uint primitive_idx = instance_primitive_indices[current_fetch_idx];
+                collected_mean2d[thread_rank] = primitive_mean2d[primitive_idx];
+                collected_conic_opacity[thread_rank] = primitive_conic_opacity[primitive_idx];
+                collected_color[thread_rank] = fmaxf(primitive_color[primitive_idx], 0.0f);
+                collected_feature[thread_rank] = primitive_feature[primitive_idx];
+            }
+            block.sync();
+            const int current_batch_size = min(config::block_size_blend, n_points_remaining);
+            for (int j = 0; !done && j < current_batch_size; ++j) {
+                // checkpoint color+transmittance and feature every 32 Gaussians
+                if (j % 32 == 0) {
+                    bucket_color_transmittance[bucket_offset * config::block_size_blend + thread_rank] = make_float4(color_pixel, transmittance);
+                    bucket_feature_accum[bucket_offset * config::block_size_blend + thread_rank] = feature_pixel;
+                    bucket_offset++;
+                }
+                n_processed++;
+                const float4 conic_opacity = collected_conic_opacity[j];
+                const float3 conic = make_float3(conic_opacity);
+                const float opacity = conic_opacity.w;
+                const float2 delta = collected_mean2d[j] - pixel;
+                const float exponent = -0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) - conic.y * delta.x * delta.y;
+                const float gaussian = expf(fminf(exponent, 0.0f));
+                if (!config::original_opacity_interpretation && gaussian < config::min_alpha_threshold) continue;
+                const float alpha = opacity * gaussian;
+                if (config::original_opacity_interpretation && alpha < config::min_alpha_threshold) continue;
+                const float blending_weight = transmittance * alpha;
+                color_pixel += blending_weight * collected_color[j];
+                feature_pixel += blending_weight * collected_feature[j];
+                transmittance *= 1.0f - alpha;
+                n_processed_and_used = n_processed;
+                if (transmittance < config::transmittance_threshold) {
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        if (inside) {
+            color_pixel += transmittance * bg_color[0];
+            const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
+            const uint n_pixels = width * height;
+            image[pixel_idx] = color_pixel.x;
+            image[n_pixels + pixel_idx] = color_pixel.y;
+            image[2 * n_pixels + pixel_idx] = color_pixel.z;
+            // feature map (no background term)
+            feature_map[pixel_idx] = feature_pixel.x;
+            feature_map[n_pixels + pixel_idx] = feature_pixel.y;
+            feature_map[2 * n_pixels + pixel_idx] = feature_pixel.z;
+            feature_map[3 * n_pixels + pixel_idx] = feature_pixel.w;
+            tile_final_transmittances[pixel_idx] = transmittance;
+            tile_n_processed[pixel_idx] = n_processed_and_used;
+        }
+        typedef cub::BlockReduce<uint, config::tile_width, cub::BLOCK_REDUCE_WARP_REDUCTIONS, config::tile_height> BlockReduce;
+        __shared__ typename BlockReduce::TempStorage temp_storage;
+        n_processed_and_used = BlockReduce(temp_storage).Reduce(n_processed_and_used, cub::Max());
+        if (thread_rank == 0) tile_max_n_processed[tile_idx] = n_processed_and_used;
+    }
+
 }

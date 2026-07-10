@@ -163,5 +163,23 @@ namespace faster_gs::rasterization {
         }
     };
 
+    // Deferred-reflection variant: alongside the base color+transmittance checkpoint
+    // we also checkpoint the accumulated feature vector (normal.xyz + reflection
+    // strength) every 32 blended Gaussians so the backward pass can restart the
+    // feature blend mid-tile, exactly like the color channels.
+    struct BucketBuffersDR {
+        uint* tile_index;
+        float4* color_transmittance;
+        float4* feature_accum;
+
+        static BucketBuffersDR from_blob(char*& blob, int n_buckets) {
+            BucketBuffersDR buffers;
+            obtain(blob, buffers.tile_index, n_buckets);
+            obtain(blob, buffers.color_transmittance, n_buckets * config::block_size_blend);
+            obtain(blob, buffers.feature_accum, n_buckets * config::block_size_blend);
+            return buffers;
+        }
+    };
+
 
 }

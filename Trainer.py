@@ -51,6 +51,7 @@ def _training_extent_camera_position(view) -> torch.Tensor:
     ),
     USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
     RANDOM_BACKGROUND_IF_ALPHA_OR_MASK=True,  # when alpha/mask is available, composite GT and render on same random color
+    WHITE_BACKGROUND=False,  # 3DGS-DR --white-background: fixed render/GT background; disables random-bg-from-alpha
     INITIALIZATION_GAUSSIAN_PLY_PATH=None,  # optional Gaussian PLY initialization (e.g. Mesh2Splat output)
     # If set to [r, g, b] in [0, 1], replaces all SH from the PLY with this view-neutral color (DC only, rest zero).
     INITIALIZATION_GAUSSIAN_PLY_DEFAULT_RGB=None,
@@ -84,6 +85,25 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         LEARNING_RATE_OPACITIES=0.025,  # use 0.05 (old default in official code) with MCMC densification or Speedy-Splat pruning to match the respective paper
         LEARNING_RATE_SCALES=0.005,
         LEARNING_RATE_ROTATIONS=0.001,
+        LEARNING_RATE_REFLECTION_STRENGTH=0.006,  # deferred reflection: per-Gaussian reflection strength
+    ),
+    # Deferred reflection schedule (3DGS-DR). Only active when MODEL.DEFERRED_REFLECTION.USE is set.
+    DEFERRED_REFLECTION_SCHEDULE=Framework.ConfigParameterList(
+        INIT_UNTIL_ITERATION=3_000,      # view-independent bootstrap; reflection/env optimization off, SH pinned to degree 0
+        PROPAGATION_INTERVAL=1_000,      # normal propagation cadence (3DGS-DR: every 1000 iters during prop window)
+        PROPAGATION_END_ITERATION=8_000, # base window; add LONGER_PROPAGATION_ITERATIONS for scenes like toaster
+        LONGER_PROPAGATION_ITERATIONS=0, # 3DGS-DR --longer_prop_iter (e.g. 24_000 for toaster)
+        PROPAGATION_ENLARGE_SCALE=1.5,   # scale-up factor for the two longest axes of reflective Gaussians
+        PROPAGATION_MIN_OPACITY=0.9,     # reset_opacity1 ceiling during propagation
+        PROPAGATION_OPACITY_FLOOR=0.01,  # reset_opacity0 floor on opacity-reset iterations
+        PROPAGATION_MIN_REFLECTION=1e-3,
+        SCALE_ENLARGE_THRESHOLD=0.02,    # enlarge_refl_scales REFL_MSK_THR (3DGS-DR default)
+        COLOR_SABOTAGE_THRESHOLD=0.05,   # dist_color REFL_MSK_THR (3DGS-DR default)
+        REFLECTION_THRESHOLD=0.1,        # r_i > this counts as reflective for specular termination
+        COLOR_SABOTAGE_NOISE=0.4,        # dist_color DIST_RANGE (3DGS-DR default)
+        SPECULAR_TERMINATION_PATIENCE=3, # stop propagation after this many checks without growth in reflective count
+        ENVMAP_LEARNING_RATE=0.01,
+        DENSIFICATION_INTERVAL_DURING_PROPAGATION=500,  # 3DGS-DR densification_interval_when_prop
     ),
 )
 class FasterGSTrainer(GuiTrainer):
@@ -99,6 +119,13 @@ class FasterGSTrainer(GuiTrainer):
         self.train_sampler = None
         self.loss = None
         self._gaussian_ply_init_active = False
+        # deferred reflection state
+        self.env_optimizer = None
+        self._dr_active = False
+        self._dr_specular_terminated = False
+        self._dr_reflective_history: list[int] = []
+        self._dr_best_reflective = 0
+        self._dr_stall_count = 0
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -166,7 +193,27 @@ class FasterGSTrainer(GuiTrainer):
             self.model.gaussians.setup_3d_filter(self.FILTER_3D, dataset)
         if self.model.ppisp is not None:
             self.model.ppisp.initialize(dataset, self.NUM_ITERATIONS)
+
+        # deferred reflection: environment map optimizer + view-independent bootstrap
+        self._dr_active = self.model.gaussians.deferred_reflection
+        if self._dr_active:
+            if self.model.environment is None:
+                raise Framework.TrainingError('deferred reflection enabled but model.environment is not built')
+            self.env_optimizer = torch.optim.Adam(
+                self.model.environment.parameters(),
+                lr=self.DEFERRED_REFLECTION_SCHEDULE.ENVMAP_LEARNING_RATE,
+                eps=1e-15,
+            )
+            # freeze reflection strength during the view-independent bootstrap
+            self._set_reflection_strength_lr(0.0)
+            Logger.log_info(
+                f'deferred reflection active: bootstrap until iter {self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION}, '
+                f'propagation every {self.DEFERRED_REFLECTION_SCHEDULE.PROPAGATION_INTERVAL} iters'
+            )
+
         self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
+        if self.WHITE_BACKGROUND or bool(getattr(Framework.config.DATASET, 'WHITE_BACKGROUND', False)):
+            Logger.log_info('white-background training: fixed render/GT background (3DGS-DR --white-background parity)')
         if self._gaussian_ply_init_active:
             Logger.log_info(
                 f'using Gaussian PLY initialization from "{Path(ply_path).expanduser()}" '
@@ -174,11 +221,85 @@ class FasterGSTrainer(GuiTrainer):
                 f'densification={self.ENABLE_DENSIFICATION_WITH_GAUSSIAN_PLY_INIT})'
             )
 
+    def _set_reflection_strength_lr(self, lr: float) -> None:
+        """Sets the learning rate of the reflection-strength optimizer group (DR only)."""
+        if self.model.gaussians.optimizer is None:
+            return
+        for group in self.model.gaussians.optimizer.param_groups:
+            if group['name'] == 'reflection_strength':
+                group['lr'] = lr
+
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
-    def increase_sh_degree(self, *_) -> None:
-        """Increase the number of used SH coefficients up to a maximum degree."""
+    def increase_sh_degree(self, iteration: int, *_) -> None:
+        """Increase the number of used SH coefficients up to a maximum degree.
+
+        With deferred reflection, higher-order SH is delayed until specular
+        termination so it does not interfere with reflection discovery (paper 3.3).
+        A propagation-end fallback ensures SH still ramps up even if the reflective
+        count never plateaus within the propagation window.
+        """
+        if self._dr_active and not self._dr_specular_terminated:
+            prop_end = (
+                self.DEFERRED_REFLECTION_SCHEDULE.PROPAGATION_END_ITERATION
+                + self.DEFERRED_REFLECTION_SCHEDULE.LONGER_PROPAGATION_ITERATIONS
+            )
+            if iteration <= prop_end:
+                return
         self.model.gaussians.increase_used_sh_degree()
+
+    @training_callback(priority=95, start_iteration='DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION', end_iteration='DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION')
+    @torch.no_grad()
+    def dr_enable_reflection(self, *_) -> None:
+        """End the view-independent bootstrap: enable reflection-strength optimization."""
+        if not self._dr_active:
+            return
+        self._set_reflection_strength_lr(self.OPTIMIZER.LEARNING_RATE_REFLECTION_STRENGTH)
+        Logger.log_info('deferred reflection: bootstrap complete, reflection strength + env map now optimizing')
+
+    @training_callback(priority=85, start_iteration='DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION', end_iteration='NUM_ITERATIONS', iteration_stride='DEFERRED_REFLECTION_SCHEDULE.PROPAGATION_INTERVAL')
+    @torch.no_grad()
+    def dr_normal_propagation(self, iteration: int, _dataset: 'BaseDataset') -> None:
+        """Normal propagation schedule matching 3DGS-DR train.py (paper 3.3).
+
+        Every ``PROPAGATION_INTERVAL`` steps until ``PROPAGATION_END + LONGER_PROP``:
+          - on ``OPACITY_RESET_INTERVAL`` multiples: ``reset_opacity0`` + ``reset_refl``
+          - otherwise: ``reset_opacity1`` + ``dist_color`` + ``enlarge_refl_scales``
+        """
+        if not self._dr_active or self._dr_specular_terminated:
+            return
+        cfg = self.DEFERRED_REFLECTION_SCHEDULE
+        prop_end = cfg.PROPAGATION_END_ITERATION + cfg.LONGER_PROPAGATION_ITERATIONS
+        if iteration > prop_end:
+            return
+
+        on_opacity_reset = iteration % self.OPACITY_RESET_INTERVAL == 0
+        if on_opacity_reset:
+            self.model.gaussians.dr_reset_opacity_floor(cfg.PROPAGATION_OPACITY_FLOOR)
+            self.model.gaussians.dr_bump_reflection_strength(cfg.PROPAGATION_MIN_REFLECTION)
+        else:
+            self.model.gaussians.dr_reset_opacity_ceiling(cfg.PROPAGATION_MIN_OPACITY)
+            self.model.gaussians.color_sabotage(
+                refl_threshold=cfg.COLOR_SABOTAGE_THRESHOLD,
+                noise=cfg.COLOR_SABOTAGE_NOISE,
+            )
+            self.model.gaussians.dr_enlarge_reflective_scales(
+                refl_threshold=cfg.SCALE_ENLARGE_THRESHOLD,
+                enlarge_scale=cfg.PROPAGATION_ENLARGE_SCALE,
+            )
+
+        n_reflective = self.model.gaussians.n_reflective(cfg.REFLECTION_THRESHOLD)
+        if n_reflective > self._dr_best_reflective:
+            self._dr_best_reflective = n_reflective
+            self._dr_stall_count = 0
+        else:
+            self._dr_stall_count += 1
+            if self._dr_stall_count >= cfg.SPECULAR_TERMINATION_PATIENCE:
+                self._dr_specular_terminated = True
+                Logger.log_info(
+                    f'deferred reflection: specular termination at iter {iteration} '
+                    f'({n_reflective:,} reflective Gaussians); enabling higher-order SH'
+                )
 
     @training_callback(priority=100, start_iteration='DENSIFICATION_START_ITERATION', end_iteration='DENSIFICATION_END_ITERATION', iteration_stride='DENSIFICATION_INTERVAL')
     @torch.no_grad()
@@ -189,6 +310,11 @@ class FasterGSTrainer(GuiTrainer):
 
         interval_multiplier = self.DENSIFICATION_INTERVAL_MULTIPLIER_GAUSSIAN_PLY_INIT if self._gaussian_ply_init_active else 1
         effective_interval = max(1, self.DENSIFICATION_INTERVAL * interval_multiplier)
+        if self._dr_active:
+            dr_cfg = self.DEFERRED_REFLECTION_SCHEDULE
+            prop_end = dr_cfg.PROPAGATION_END_ITERATION + dr_cfg.LONGER_PROPAGATION_ITERATIONS
+            if dr_cfg.INIT_UNTIL_ITERATION < iteration <= prop_end:
+                effective_interval = max(1, dr_cfg.DENSIFICATION_INTERVAL_DURING_PROPAGATION * interval_multiplier)
         if (iteration - self.DENSIFICATION_START_ITERATION) % effective_interval != 0:
             return
 
@@ -259,8 +385,14 @@ class FasterGSTrainer(GuiTrainer):
         # get random view
         view = self.train_sampler.get(dataset=dataset)['view']
         supervision_alpha = get_supervision_alpha(view)
-        use_random_bg = self.USE_RANDOM_BACKGROUND_COLOR or (
-            self.RANDOM_BACKGROUND_IF_ALPHA_OR_MASK and supervision_alpha is not None
+        dataset_white_bg = bool(getattr(Framework.config.DATASET, 'WHITE_BACKGROUND', False))
+        use_white_background = self.WHITE_BACKGROUND or dataset_white_bg
+        use_random_bg = (
+            not use_white_background
+            and (
+                self.USE_RANDOM_BACKGROUND_COLOR
+                or (self.RANDOM_BACKGROUND_IF_ALPHA_OR_MASK and supervision_alpha is not None)
+            )
         )
         bg_color = torch.rand_like(view.camera.background_color) if use_random_bg else view.camera.background_color
         image = self.renderer.render_image_training(
@@ -280,6 +412,11 @@ class FasterGSTrainer(GuiTrainer):
         self.model.gaussians.optimizer.step()
         self.model.gaussians.optimizer.zero_grad()
         self.model.gaussians.post_optimizer_step(inject_noise=self.USE_MCMC)
+        # deferred reflection: optimize the environment map after the bootstrap
+        if self._dr_active and self.env_optimizer is not None:
+            if iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION:
+                self.env_optimizer.step()
+            self.env_optimizer.zero_grad(set_to_none=True)
         if self.model.ppisp is not None:
             self.model.ppisp.step()
 

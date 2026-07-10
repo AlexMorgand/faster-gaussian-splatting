@@ -42,18 +42,67 @@ void faster_gs::rasterization::backward(
     const float focal_y,
     const float center_x,
     const float center_y,
-    const bool proper_antialiasing)
+    const bool proper_antialiasing,
+    const float4* features,
+    const float* grad_feature_map,
+    const float* feature_map,
+    float4* grad_features)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const int n_tiles = grid.x * grid.y;
     const int end_bit = extract_end_bit(n_tiles - 1);
+    const bool deferred_reflection = features != nullptr;
 
     PrimitiveBuffers primitive_buffers = PrimitiveBuffers::from_blob(primitive_buffers_blob, n_primitives);
     TileBuffers tile_buffers = TileBuffers::from_blob(tile_buffers_blob, n_tiles);
-    BucketBuffers bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
+    // reconstruct the bucket blob with the layout used by the matching forward pass
+    BucketBuffers bucket_buffers;
+    BucketBuffersDR bucket_buffers_dr;
+    if (deferred_reflection) {
+        char* blob = bucket_buffers_blob;
+        bucket_buffers_dr = BucketBuffersDR::from_blob(blob, n_buckets);
+    }
+    else {
+        char* blob = bucket_buffers_blob;
+        bucket_buffers = BucketBuffers::from_blob(blob, n_buckets);
+    }
 
     // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
+        if (deferred_reflection) {
+            kernels::backward::blend_backward_dr_cu<<<n_buckets, 32>>>(
+                tile_buffers.instance_ranges,
+                tile_buffers.buckets_offset,
+                instance_primitive_indices,
+                primitive_buffers.mean2d,
+                primitive_buffers.conic_opacity,
+                primitive_buffers.color,
+                features,
+                bg_color,
+                grad_image,
+                grad_feature_map,
+                image,
+                feature_map,
+                tile_buffers.final_transmittances,
+                tile_buffers.max_n_processed,
+                tile_buffers.n_processed,
+                bucket_buffers_dr.tile_index,
+                bucket_buffers_dr.color_transmittance,
+                bucket_buffers_dr.feature_accum,
+                grad_mean2d_helper,
+                grad_conic_helper,
+                grad_opacities,
+                grad_sh_coefficients_0,
+                grad_features,
+                n_primitives,
+                width,
+                height,
+                grid.x,
+                proper_antialiasing
+            );
+            CHECK_CUDA(config::debug, "blend_backward (dr)")
+            return;
+        }
         kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
             tile_buffers.instance_ranges,
             tile_buffers.buckets_offset,
