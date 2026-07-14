@@ -8,7 +8,7 @@ import Framework
 from Cameras.utils import invert_3d_affine, rotation_matrix_to_quaternion
 from Cameras.Perspective import PerspectiveCamera
 from Datasets.Base import BaseDataset
-from Datasets.utils import View
+from Datasets.utils import View, transform_world_normal_map, world_normal_foreground_mask
 from Logging import Logger
 from Methods.Base.Renderer import BaseModel
 from Methods.Base.Renderer import BaseRenderer
@@ -132,7 +132,44 @@ class FasterGSRenderer(BaseRenderer):
         refl = self.model.gaussians.reflection_strength  # (N, 1)
         return torch.cat([normals, refl], dim=1).contiguous()
 
-    def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> torch.Tensor:
+    def _mesh_normal_terms(self, view: View) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Returns optional mesh world normals and a foreground mask for DR priors."""
+        mesh_normal = view.world_normal
+        if mesh_normal is None:
+            return None, None
+        alignment = view.exif.get('scene_alignment_transform')
+        if alignment is not None:
+            mesh_normal = transform_world_normal_map(mesh_normal, alignment)
+        mask = view.segmentation
+        if mask is None:
+            mask = world_normal_foreground_mask(mesh_normal)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        # 3DGS-DR: zero GT normals outside the asset mask before hijack / supervision.
+        mesh_normal = mesh_normal * mask
+        return mesh_normal, mask
+
+    def _compose_deferred(
+        self,
+        base_image: torch.Tensor,
+        feature_map: torch.Tensor,
+        view: View,
+    ) -> dict[str, torch.Tensor]:
+        mesh_normal, mesh_mask = self._mesh_normal_terms(view)
+        hijack = mesh_normal is not None and bool(
+            getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'MESH_NORMAL_HIJACK', True)
+        )
+        return compose_deferred(
+            base_image,
+            feature_map,
+            view,
+            self.model.environment,
+            mesh_normal_map=mesh_normal,
+            mesh_normal_mask=mesh_mask,
+            mesh_normal_hijack=hijack,
+        )
+
+    def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
         means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
             view,
@@ -154,7 +191,8 @@ class FasterGSRenderer(BaseRenderer):
                 densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
                 rasterizer_settings=settings,
             )
-            image = compose_deferred(base_image, feature_map, view, self.model.environment)['rgb']
+            decomposition = self._compose_deferred(base_image, feature_map, view)
+            image = decomposition['rgb']
         else:
             image = diff_rasterize(
                 means=means,
@@ -166,9 +204,16 @@ class FasterGSRenderer(BaseRenderer):
                 densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
                 rasterizer_settings=settings,
             )
+            decomposition = None
         if self.model.ppisp is not None:
             image = self.model.ppisp(image, view)
-        return image
+        outputs: dict[str, torch.Tensor] = {'rgb': image}
+        if decomposition is not None:
+            outputs['gaussian_normal'] = decomposition['gaussian_normal']
+            if decomposition['mesh_normal'] is not None:
+                outputs['mesh_normal'] = decomposition['mesh_normal']
+                outputs['mesh_normal_mask'] = decomposition['mesh_normal_mask']
+        return outputs
 
     @torch.no_grad()
     def render_image_inference(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
@@ -195,7 +240,7 @@ class FasterGSRenderer(BaseRenderer):
                 densification_info=torch.empty(0),
                 rasterizer_settings=settings,
             )
-            decomposition = compose_deferred(base_image, feature_map, view, self.model.environment)
+            decomposition = self._compose_deferred(base_image, feature_map, view)
             image = decomposition['rgb']
         else:
             image = diff_rasterize(

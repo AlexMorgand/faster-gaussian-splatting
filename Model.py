@@ -314,6 +314,14 @@ class Gaussians(torch.nn.Module):
         normals = torch.where(flip, -normals, normals)
         return normals
 
+    def set_opacity_lr(self, lr: float) -> None:
+        """3DGS-DR ``set_opacity_lr``: update the opacity optimizer group learning rate."""
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group['name'] == 'opacities':
+                group['lr'] = lr
+
     @torch.no_grad()
     def dr_reset_opacity_floor(self, floor: float = 0.01) -> None:
         """3DGS-DR ``reset_opacity0``: clamp high opacities down to ``floor``."""
@@ -977,6 +985,13 @@ class Gaussians(torch.nn.Module):
         USE=False,
         REFL_INIT_VALUE=1e-3,
         ENVMAP_RESOLUTION=256,
+        MESH_NORMAL_HIJACK=False,
+        ENVMAP_HDRI=None,
+        ENVMAP_EXPOSURE=1.0,
+        ENVMAP_YAW_DEG=0.0,
+        ENVMAP_ROLL_DEG=0.0,
+        FREEZE_ENVMAP=False,
+        ENVMAP_ANCHOR_LAMBDA=0.1,
     ),
 )
 class FasterGSModel(BaseModel):

@@ -75,6 +75,9 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         LAMBDA_DSSIM=0.2,  # weight for the DSSIM loss on the rgb image
         LAMBDA_OPACITY_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
         LAMBDA_SCALE_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
+        LAMBDA_NORMAL=0.0,  # mesh normal supervision (3DGS-DR default 0.1 when enabled)
+        LAMBDA_ENVMAP_ANCHOR=0.0,  # pull cubemap back toward HDRI bake (set when ENVMAP_HDRI is used)
+        NORMAL_LOSS_UNTIL_ITERATION=0,  # 0 = no upper bound
     ),
     OPTIMIZER=Framework.ConfigParameterList(
         LEARNING_RATE_MEANS_INIT=0.00016,
@@ -101,7 +104,8 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         COLOR_SABOTAGE_THRESHOLD=0.05,   # dist_color REFL_MSK_THR (3DGS-DR default)
         REFLECTION_THRESHOLD=0.1,        # r_i > this counts as reflective for specular termination
         COLOR_SABOTAGE_NOISE=0.4,        # dist_color DIST_RANGE (3DGS-DR default)
-        SPECULAR_TERMINATION_PATIENCE=3, # stop propagation after this many checks without growth in reflective count
+        SPECULAR_TERMINATION_PATIENCE=0, # 0 = disabled (3DGS-DR runs the full propagation window)
+        OPAC_LR0_INTERVAL=200,         # 3DGS-DR opac_lr0_interval; 0 disables opacity-lr cycling during propagation
         ENVMAP_LEARNING_RATE=0.01,
         DENSIFICATION_INTERVAL_DURING_PROPAGATION=500,  # 3DGS-DR densification_interval_when_prop
     ),
@@ -126,6 +130,7 @@ class FasterGSTrainer(GuiTrainer):
         self._dr_reflective_history: list[int] = []
         self._dr_best_reflective = 0
         self._dr_stall_count = 0
+        self._envmap_bake_snapshot: dict[str, torch.Tensor] | None = None
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -199,19 +204,62 @@ class FasterGSTrainer(GuiTrainer):
         if self._dr_active:
             if self.model.environment is None:
                 raise Framework.TrainingError('deferred reflection enabled but model.environment is not built')
+            dr_cfg = self.model.DEFERRED_REFLECTION
+            hdri_path = getattr(dr_cfg, 'ENVMAP_HDRI', None)
+            if hdri_path not in (None, ''):
+                from Methods.FasterGS.envmap_utils import bake_hdri_into_environment_map, snapshot_envmap_parameters
+                # setup_gaussians runs under @torch.no_grad(); baking needs a live autograd graph.
+                with torch.enable_grad():
+                    bake_hdri_into_environment_map(
+                        self.model.environment,
+                        str(Path(hdri_path).expanduser()),
+                        exposure=float(getattr(dr_cfg, 'ENVMAP_EXPOSURE', 1.0)),
+                        yaw_deg=float(getattr(dr_cfg, 'ENVMAP_YAW_DEG', 0.0)),
+                    )
+                self._envmap_bake_snapshot = snapshot_envmap_parameters(self.model.environment)
+                anchor_lambda = float(getattr(self.LOSS, 'LAMBDA_ENVMAP_ANCHOR', 0.0))
+                if anchor_lambda > 0.0:
+                    Logger.log_info(
+                        f'envmap HDRI anchor enabled (lambda={anchor_lambda}); '
+                        'cubemap stays near bake while fitting proxy2real specular'
+                    )
             self.env_optimizer = torch.optim.Adam(
                 self.model.environment.parameters(),
                 lr=self.DEFERRED_REFLECTION_SCHEDULE.ENVMAP_LEARNING_RATE,
                 eps=1e-15,
             )
+            if getattr(dr_cfg, 'FREEZE_ENVMAP', False):
+                self._set_envmap_lr(0.0)
+                Logger.log_info('freeze_envmap: cubemap fixed after HDRI bake')
             # freeze reflection strength during the view-independent bootstrap
             self._set_reflection_strength_lr(0.0)
+            dr_sched = self.DEFERRED_REFLECTION_SCHEDULE
+            longer = dr_sched.LONGER_PROPAGATION_ITERATIONS
+            prop_end = dr_sched.PROPAGATION_END_ITERATION + longer
+            if longer > 0:
+                expected_densify_end = dr_sched.PROPAGATION_END_ITERATION + longer
+                if self.DENSIFICATION_END_ITERATION < expected_densify_end:
+                    Logger.log_warning(
+                        f'extending DENSIFICATION_END_ITERATION '
+                        f'{self.DENSIFICATION_END_ITERATION} -> {expected_densify_end} '
+                        f'(LONGER_PROPAGATION_ITERATIONS={longer})'
+                    )
+                    self.DENSIFICATION_END_ITERATION = expected_densify_end
             Logger.log_info(
-                f'deferred reflection active: bootstrap until iter {self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION}, '
-                f'propagation every {self.DEFERRED_REFLECTION_SCHEDULE.PROPAGATION_INTERVAL} iters'
+                f'deferred reflection active: bootstrap until iter {dr_sched.INIT_UNTIL_ITERATION}, '
+                f'propagation until iter {prop_end} every {dr_sched.PROPAGATION_INTERVAL} iters, '
+                f'densify until iter {self.DENSIFICATION_END_ITERATION}, '
+                f'opac_lr0_interval={dr_sched.OPAC_LR0_INTERVAL}'
             )
 
         self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
+        normals_path = getattr(Framework.config.DATASET, 'EXTERNAL_NORMALS_PATH', None)
+        if normals_path not in (None, ''):
+            Logger.log_info(
+                f'mesh normal prior enabled from "{normals_path}" '
+                f'(hijack={self.model.DEFERRED_REFLECTION.MESH_NORMAL_HIJACK}, '
+                f'lambda_normal={self.LOSS.LAMBDA_NORMAL})'
+            )
         if self.WHITE_BACKGROUND or bool(getattr(Framework.config.DATASET, 'WHITE_BACKGROUND', False)):
             Logger.log_info('white-background training: fixed render/GT background (3DGS-DR --white-background parity)')
         if self._gaussian_ply_init_active:
@@ -228,6 +276,17 @@ class FasterGSTrainer(GuiTrainer):
         for group in self.model.gaussians.optimizer.param_groups:
             if group['name'] == 'reflection_strength':
                 group['lr'] = lr
+
+    def _set_envmap_lr(self, lr: float) -> None:
+        """Sets the learning rate of the environment-map optimizer (DR only)."""
+        if self.env_optimizer is None:
+            return
+        for group in self.env_optimizer.param_groups:
+            group['lr'] = lr
+
+    def _set_opacity_lr(self, lr: float) -> None:
+        """Sets the learning rate of the opacity optimizer group (DR propagation schedule)."""
+        self.model.gaussians.set_opacity_lr(lr)
 
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
@@ -265,6 +324,7 @@ class FasterGSTrainer(GuiTrainer):
         Every ``PROPAGATION_INTERVAL`` steps until ``PROPAGATION_END + LONGER_PROP``:
           - on ``OPACITY_RESET_INTERVAL`` multiples: ``reset_opacity0`` + ``reset_refl``
           - otherwise: ``reset_opacity1`` + ``dist_color`` + ``enlarge_refl_scales``
+          - optional ``OPAC_LR0_INTERVAL`` cycling: zero opacity lr between resets
         """
         if not self._dr_active or self._dr_specular_terminated:
             return
@@ -287,19 +347,40 @@ class FasterGSTrainer(GuiTrainer):
                 refl_threshold=cfg.SCALE_ENLARGE_THRESHOLD,
                 enlarge_scale=cfg.PROPAGATION_ENLARGE_SCALE,
             )
+            if cfg.OPAC_LR0_INTERVAL > 0 and iteration != prop_end:
+                self._set_opacity_lr(0.0)
 
-        n_reflective = self.model.gaussians.n_reflective(cfg.REFLECTION_THRESHOLD)
-        if n_reflective > self._dr_best_reflective:
-            self._dr_best_reflective = n_reflective
-            self._dr_stall_count = 0
-        else:
-            self._dr_stall_count += 1
-            if self._dr_stall_count >= cfg.SPECULAR_TERMINATION_PATIENCE:
-                self._dr_specular_terminated = True
-                Logger.log_info(
-                    f'deferred reflection: specular termination at iter {iteration} '
-                    f'({n_reflective:,} reflective Gaussians); enabling higher-order SH'
-                )
+        if cfg.SPECULAR_TERMINATION_PATIENCE > 0:
+            n_reflective = self.model.gaussians.n_reflective(cfg.REFLECTION_THRESHOLD)
+            if n_reflective > self._dr_best_reflective:
+                self._dr_best_reflective = n_reflective
+                self._dr_stall_count = 0
+            else:
+                self._dr_stall_count += 1
+                if self._dr_stall_count >= cfg.SPECULAR_TERMINATION_PATIENCE:
+                    self._dr_specular_terminated = True
+                    Logger.log_info(
+                        f'deferred reflection: specular termination at iter {iteration} '
+                        f'({n_reflective:,} reflective Gaussians); enabling higher-order SH'
+                    )
+
+    @training_callback(
+        priority=84,
+        start_iteration='DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION',
+        end_iteration='NUM_ITERATIONS',
+        iteration_stride='DEFERRED_REFLECTION_SCHEDULE.OPAC_LR0_INTERVAL',
+    )
+    @torch.no_grad()
+    def dr_restore_opacity_lr(self, iteration: int, *_) -> None:
+        """3DGS-DR: periodically restore full opacity lr during the propagation window."""
+        if not self._dr_active:
+            return
+        cfg = self.DEFERRED_REFLECTION_SCHEDULE
+        if cfg.OPAC_LR0_INTERVAL <= 0:
+            return
+        prop_end = cfg.PROPAGATION_END_ITERATION + cfg.LONGER_PROPAGATION_ITERATIONS
+        if cfg.INIT_UNTIL_ITERATION < iteration <= prop_end and iteration % cfg.OPAC_LR0_INTERVAL == 0:
+            self._set_opacity_lr(self.OPTIMIZER.LEARNING_RATE_OPACITIES)
 
     @training_callback(priority=100, start_iteration='DENSIFICATION_START_ITERATION', end_iteration='DENSIFICATION_END_ITERATION', iteration_stride='DENSIFICATION_INTERVAL')
     @torch.no_grad()
@@ -395,17 +476,43 @@ class FasterGSTrainer(GuiTrainer):
             )
         )
         bg_color = torch.rand_like(view.camera.background_color) if use_random_bg else view.camera.background_color
-        image = self.renderer.render_image_training(
+        render_out = self.renderer.render_image_training(
             view=view,
             update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
             bg_color=bg_color,
         )
+        image = render_out['rgb']
         # calculate loss
         # compose gt with background color if needed  # FIXME: integrate into data model
         rgb_gt = view.rgb
         if supervision_alpha is not None:
             rgb_gt = apply_background_color(rgb_gt, supervision_alpha, bg_color)
         loss = self.loss(image, rgb_gt)
+        normal_until = int(getattr(self.LOSS, 'NORMAL_LOSS_UNTIL_ITERATION', 0) or 0)
+        apply_normal_loss = (
+            self.LOSS.LAMBDA_NORMAL > 0.0
+            and iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION
+            and (normal_until <= 0 or iteration <= normal_until)
+            and 'gaussian_normal' in render_out
+            and 'mesh_normal' in render_out
+        )
+        if apply_normal_loss:
+            loss = loss + self.loss.mesh_normal_supervision_loss(
+                render_out['gaussian_normal'],
+                render_out['mesh_normal'],
+                render_out.get('mesh_normal_mask'),
+            )
+        anchor_lambda = float(getattr(self.LOSS, 'LAMBDA_ENVMAP_ANCHOR', 0.0))
+        if (
+            anchor_lambda > 0.0
+            and self._envmap_bake_snapshot is not None
+            and iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION
+        ):
+            from Methods.FasterGS.envmap_utils import envmap_anchor_loss
+            loss = loss + anchor_lambda * envmap_anchor_loss(
+                self.model.environment,
+                self._envmap_bake_snapshot,
+            )
         # backward
         loss.backward()
         # optimizer step
