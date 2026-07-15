@@ -8,7 +8,7 @@ import Framework
 from Cameras.utils import invert_3d_affine, rotation_matrix_to_quaternion
 from Cameras.Perspective import PerspectiveCamera
 from Datasets.Base import BaseDataset
-from Datasets.utils import View, transform_world_normal_map, world_normal_foreground_mask
+from Datasets.utils import View, transform_world_normal_map, world_normal_foreground_mask, gbuffer_foreground_mask
 from Logging import Logger
 from Methods.Base.Renderer import BaseModel
 from Methods.Base.Renderer import BaseRenderer
@@ -149,6 +149,28 @@ class FasterGSRenderer(BaseRenderer):
         mesh_normal = mesh_normal * mask
         return mesh_normal, mask
 
+    def _mesh_albedo_terms(self, view: View) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        mesh_albedo = view.mesh_albedo
+        if mesh_albedo is None:
+            return None, None
+        mask = view.segmentation
+        if mask is None:
+            mask = gbuffer_foreground_mask(mesh_albedo)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        return mesh_albedo * mask, mask
+
+    def _mesh_metallic_terms(self, view: View) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        mesh_metallic = view.mesh_metallic
+        if mesh_metallic is None:
+            return None, None
+        mask = view.segmentation
+        if mask is None:
+            mask = gbuffer_foreground_mask(mesh_metallic)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        return mesh_metallic * mask, mask
+
     def _compose_deferred(
         self,
         base_image: torch.Tensor,
@@ -156,9 +178,11 @@ class FasterGSRenderer(BaseRenderer):
         view: View,
     ) -> dict[str, torch.Tensor]:
         mesh_normal, mesh_mask = self._mesh_normal_terms(view)
+        mesh_albedo, albedo_mask = self._mesh_albedo_terms(view)
         hijack = mesh_normal is not None and bool(
             getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'MESH_NORMAL_HIJACK', True)
         )
+        force_albedo = bool(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'FORCE_ALBEDO_BASE_COLOR', False))
         return compose_deferred(
             base_image,
             feature_map,
@@ -167,9 +191,19 @@ class FasterGSRenderer(BaseRenderer):
             mesh_normal_map=mesh_normal,
             mesh_normal_mask=mesh_mask,
             mesh_normal_hijack=hijack,
+            mesh_albedo_map=mesh_albedo,
+            mesh_albedo_mask=albedo_mask,
+            force_albedo_base_color=force_albedo,
         )
 
-    def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> dict[str, torch.Tensor]:
+    def render_image_training(
+        self,
+        view: View,
+        update_densification_info: bool,
+        bg_color: torch.Tensor,
+        *,
+        use_diffuse_bootstrap: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
         means, rotations, sh_rotation, w2c, cam_position = self._get_turntable_render_data(
             view,
@@ -178,7 +212,7 @@ class FasterGSRenderer(BaseRenderer):
             use_original_camera_fast_path=True,
         )
         settings = extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING, sh_rotation, w2c, cam_position)
-        if self.model.gaussians.deferred_reflection:
+        if self.model.gaussians.deferred_reflection and not use_diffuse_bootstrap:
             features = self._deferred_features(view, cam_position)
             base_image, feature_map = diff_rasterize_dr(
                 means=means,
@@ -209,10 +243,19 @@ class FasterGSRenderer(BaseRenderer):
             image = self.model.ppisp(image, view)
         outputs: dict[str, torch.Tensor] = {'rgb': image}
         if decomposition is not None:
+            outputs['base_color'] = decomposition['base_color']
+            outputs['reflection_strength'] = decomposition['reflection_strength']
             outputs['gaussian_normal'] = decomposition['gaussian_normal']
             if decomposition['mesh_normal'] is not None:
                 outputs['mesh_normal'] = decomposition['mesh_normal']
                 outputs['mesh_normal_mask'] = decomposition['mesh_normal_mask']
+            if decomposition.get('mesh_albedo') is not None:
+                outputs['mesh_albedo'] = decomposition['mesh_albedo']
+                outputs['mesh_albedo_mask'] = decomposition['mesh_albedo_mask']
+            mesh_metallic, mesh_metallic_mask = self._mesh_metallic_terms(view)
+            if mesh_metallic is not None:
+                outputs['mesh_metallic'] = mesh_metallic
+                outputs['mesh_metallic_mask'] = mesh_metallic_mask
         return outputs
 
     @torch.no_grad()

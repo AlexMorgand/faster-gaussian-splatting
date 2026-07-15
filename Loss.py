@@ -24,6 +24,9 @@ class FasterGSLoss(BaseLoss):
     def __init__(self, loss_config: ConfigParameterList, model: FasterGSModel) -> None:
         super().__init__()
         self._lambda_normal = float(getattr(loss_config, 'LAMBDA_NORMAL', 0.0))
+        self._lambda_albedo_prior = float(getattr(loss_config, 'LAMBDA_ALBEDO_PRIOR', 0.0))
+        self._lambda_refl_prior = float(getattr(loss_config, 'LAMBDA_REFL_PRIOR', 0.0))
+        self._refl_prior_scale = float(getattr(loss_config, 'REFL_PRIOR_SCALE', 0.4))
         self.add_loss_metric('L1_Color', torch.nn.functional.l1_loss, loss_config.LAMBDA_L1)
         self.add_loss_metric('DSSIM_Color', fused_dssim, loss_config.LAMBDA_DSSIM)
         self.add_loss_metric('OPACITY_REGULARIZATION', model.gaussians.opacity_regularization_loss, loss_config.LAMBDA_OPACITY_REGULARIZATION)
@@ -53,3 +56,41 @@ class FasterGSLoss(BaseLoss):
         if self._lambda_normal <= 0.0:
             return gaussian_normal.new_zeros(())
         return self._lambda_normal * normal_map_loss(gaussian_normal, mesh_normal, mesh_normal_mask)
+
+    def reflection_strength_prior_loss(
+        self,
+        pred_refl: torch.Tensor,
+        target_metallic: torch.Tensor,
+        target_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self._lambda_refl_prior <= 0.0:
+            return pred_refl.new_zeros(())
+        target = target_metallic * self._refl_prior_scale
+        if target_mask is None:
+            return self._lambda_refl_prior * torch.nn.functional.l1_loss(pred_refl, target)
+        weight = target_mask.squeeze(0) if target_mask.dim() == 3 else target_mask
+        return self._lambda_refl_prior * (
+            (torch.abs(pred_refl.squeeze(0) - target.squeeze(0)) * weight.float()).sum()
+            / weight.sum().clamp(min=1.0)
+        )
+
+    def albedo_prior_loss(
+        self,
+        pred_albedo: torch.Tensor,
+        target_albedo: torch.Tensor,
+        albedo_mask: torch.Tensor | None,
+        metallic: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._lambda_albedo_prior <= 0.0:
+            return pred_albedo.new_zeros(())
+        weight = albedo_mask
+        if weight is None:
+            weight = torch.ones_like(pred_albedo[:1])
+        elif weight.dim() == 2:
+            weight = weight.unsqueeze(0)
+        if metallic is not None:
+            weight = weight * (1.0 - metallic)
+        denom = weight.sum() * pred_albedo.shape[0] + 1e-6
+        return self._lambda_albedo_prior * (
+            (torch.abs(pred_albedo - target_albedo) * weight.float()).sum() / denom
+        )

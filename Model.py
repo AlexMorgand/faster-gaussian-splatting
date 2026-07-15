@@ -332,16 +332,30 @@ class Gaussians(torch.nn.Module):
         self._opacities = self._get_param('opacities')
 
     @torch.no_grad()
-    def dr_reset_opacity_ceiling(self, ceiling: float = 0.9) -> None:
+    def dr_reset_opacity_ceiling(
+        self,
+        ceiling: float = 0.9,
+        exclusive_msk: torch.Tensor | None = None,
+    ) -> None:
         """3DGS-DR ``reset_opacity1``: raise low opacities up to ``ceiling``."""
         ceil_logit = math.log(ceiling / (1.0 - ceiling))
-        above = self.opacities > ceiling
-        new_opacities = torch.where(above, self._opacities, torch.full_like(self._opacities, ceil_logit))
+        skip = self.opacities.flatten() > ceiling
+        if exclusive_msk is not None:
+            skip = torch.logical_or(skip, exclusive_msk)
+        new_opacities = torch.where(
+            skip.reshape_as(self._opacities),
+            self._opacities,
+            torch.full_like(self._opacities, ceil_logit),
+        )
         replace_param_group_data(self.optimizer, new_opacities, 'opacities')
         self._opacities = self._get_param('opacities')
 
     @torch.no_grad()
-    def dr_bump_reflection_strength(self, min_reflection: float = 1e-3) -> None:
+    def dr_bump_reflection_strength(
+        self,
+        min_reflection: float = 1e-3,
+        exclusive_msk: torch.Tensor | None = None,
+    ) -> None:
         """3DGS-DR ``reset_refl``: raise reflection strength to at least ``min_reflection``."""
         if self._reflection_strength is None:
             return
@@ -350,6 +364,8 @@ class Gaussians(torch.nn.Module):
             self._reflection_strength,
             torch.full_like(self._reflection_strength, min_refl_logit),
         )
+        if exclusive_msk is not None:
+            new_reflection[exclusive_msk] = self._reflection_strength[exclusive_msk]
         replace_param_group_data(self.optimizer, new_reflection, 'reflection_strength')
         self._reflection_strength = self._get_param('reflection_strength')
 
@@ -358,18 +374,21 @@ class Gaussians(torch.nn.Module):
         self,
         refl_threshold: float = 0.02,
         enlarge_scale: float = 1.5,
+        exclusive_msk: torch.Tensor | None = None,
     ) -> None:
         """3DGS-DR ``reset_scale`` / ``enlarge_refl_scales``: scale the two longest axes."""
         if self._reflection_strength is None:
             return
-        reflective = self.reflection_strength.flatten() >= refl_threshold
-        if not reflective.any():
+        skip = self.reflection_strength.flatten() < refl_threshold
+        if exclusive_msk is not None:
+            skip = torch.logical_or(skip, exclusive_msk)
+        if not (~skip).any():
             return
         scales = self._scales  # logspace (N, 3)
         min_idx = self.scales.argmin(dim=1)
         enlarge = torch.full_like(scales, fill_value=math.log(enlarge_scale))
         enlarge[torch.arange(scales.shape[0], device=scales.device), min_idx] = 0.0
-        enlarge[~reflective] = 0.0
+        enlarge[skip] = 0.0
         new_scales = scales + enlarge
         replace_param_group_data(self.optimizer, new_scales, 'scales')
         self._scales = self._get_param('scales')
@@ -384,16 +403,23 @@ class Gaussians(torch.nn.Module):
         self.dr_enlarge_reflective_scales(refl_threshold=refl_threshold, enlarge_scale=enlarge_scale)
 
     @torch.no_grad()
-    def color_sabotage(self, refl_threshold: float = 0.05, noise: float = 0.4) -> None:
+    def color_sabotage(
+        self,
+        refl_threshold: float = 0.05,
+        noise: float = 0.4,
+        exclusive_msk: torch.Tensor | None = None,
+    ) -> None:
         """3DGS-DR ``dist_color``: perturb diffuse SH of non-reflective Gaussians."""
         if self._reflection_strength is None:
             return
-        non_reflective = self.reflection_strength.flatten() <= refl_threshold
-        if not non_reflective.any():
+        skip = self.reflection_strength.flatten() > refl_threshold
+        if exclusive_msk is not None:
+            skip = torch.logical_or(skip, exclusive_msk)
+        if not (~skip).any():
             return
         sh0 = self._sh_coefficients_0.clone()
         perturb = (torch.rand_like(sh0) * 2.0 - 1.0) * noise
-        perturb[~non_reflective] = 0.0
+        perturb[skip] = 0.0
         replace_param_group_data(self.optimizer, sh0 + perturb, 'sh_coefficients_0')
         self._sh_coefficients_0 = self._get_param('sh_coefficients_0')
 
@@ -986,6 +1012,7 @@ class Gaussians(torch.nn.Module):
         REFL_INIT_VALUE=1e-3,
         ENVMAP_RESOLUTION=256,
         MESH_NORMAL_HIJACK=False,
+        FORCE_ALBEDO_BASE_COLOR=False,
         ENVMAP_HDRI=None,
         ENVMAP_EXPOSURE=1.0,
         ENVMAP_YAW_DEG=0.0,

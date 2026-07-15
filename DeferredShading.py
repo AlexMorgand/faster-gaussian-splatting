@@ -97,6 +97,9 @@ def compose_deferred(
     mesh_normal_map: torch.Tensor | None = None,
     mesh_normal_mask: torch.Tensor | None = None,
     mesh_normal_hijack: bool = True,
+    mesh_albedo_map: torch.Tensor | None = None,
+    mesh_albedo_mask: torch.Tensor | None = None,
+    force_albedo_base_color: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Compose the final deferred-reflection image.
 
@@ -114,6 +117,8 @@ def compose_deferred(
     gaussian_normal_map = feature_map[:3]
     refl_strength = feature_map[3:4].clamp(0.0, 1.0)
     gaussian_normals = torch.nn.functional.normalize(gaussian_normal_map, dim=0, eps=1e-6)
+    if force_albedo_base_color and mesh_albedo_map is not None and mesh_albedo_mask is not None:
+        base_color = mesh_albedo_map * mesh_albedo_mask
     if mesh_normal_map is not None and mesh_normal_hijack:
         # 3DGS-DR: GT mesh normals from normals/ fully drive cubemap lookup (detached).
         normals = torch.nn.functional.normalize(mesh_normal_map, dim=0, eps=1e-6).detach()
@@ -142,4 +147,6 @@ def compose_deferred(
         'gaussian_normal': gaussian_normals,
         'mesh_normal': mesh_normal_map,
         'mesh_normal_mask': mesh_normal_mask,
+        'mesh_albedo': mesh_albedo_map,
+        'mesh_albedo_mask': mesh_albedo_mask,
     }

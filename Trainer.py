@@ -76,8 +76,13 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         LAMBDA_OPACITY_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
         LAMBDA_SCALE_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
         LAMBDA_NORMAL=0.0,  # mesh normal supervision (3DGS-DR default 0.1 when enabled)
+        LAMBDA_ALBEDO_PRIOR=0.0,  # pull rasterized base_color toward mesh albedo (3DGS-DR default 0.02)
+        LAMBDA_REFL_PRIOR=0.0,  # pull reflection strength toward mesh metallic (3DGS-DR default 0.05)
+        REFL_PRIOR_SCALE=0.4,  # scale metallic target before reflection-strength prior
         LAMBDA_ENVMAP_ANCHOR=0.0,  # pull cubemap back toward HDRI bake (set when ENVMAP_HDRI is used)
         NORMAL_LOSS_UNTIL_ITERATION=0,  # 0 = no upper bound
+        ALBEDO_PRIOR_UNTIL_ITERATION=0,
+        REFL_PRIOR_UNTIL_ITERATION=0,
     ),
     OPTIMIZER=Framework.ConfigParameterList(
         LEARNING_RATE_MEANS_INIT=0.00016,
@@ -108,6 +113,15 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         OPAC_LR0_INTERVAL=200,         # 3DGS-DR opac_lr0_interval; 0 disables opacity-lr cycling during propagation
         ENVMAP_LEARNING_RATE=0.01,
         DENSIFICATION_INTERVAL_DURING_PROPAGATION=500,  # 3DGS-DR densification_interval_when_prop
+        # 3DGS-DR parity experiments (enable cumulatively; defaults preserve pre-parity behaviour).
+        PARITY_DIFFUSE_BOOTSTRAP=True,  # iter <= INIT: diffuse-only rasterizer (3DGS-DR c3 parity)
+        PARITY_SKIP_VANILLA_OPACITY_RESET_DURING_PROP=False,  # no FasterGS reset_opacities during prop
+        PARITY_PROPAGATION_AFTER_INIT=False,  # propagation window (INIT, PROP_END] not [INIT, PROP_END]
+        # Real-scene env scope (3DGS-DR --use_env_scope): limit reflection learning to a world-space sphere.
+        USE_ENV_SCOPE=False,
+        ENV_SCOPE_CENTER=[0.0, 0.0, 0.0],
+        ENV_SCOPE_RADIUS=0.0,
+        REFL_MASK_LOSS_WEIGHT=0.4,  # 3DGS-DR REFL_MSK_LOSS_W
     ),
 )
 class FasterGSTrainer(GuiTrainer):
@@ -131,6 +145,15 @@ class FasterGSTrainer(GuiTrainer):
         self._dr_best_reflective = 0
         self._dr_stall_count = 0
         self._envmap_bake_snapshot: dict[str, torch.Tensor] | None = None
+        self._env_scope_center: torch.Tensor | None = None
+        self._env_scope_radius_sq: float | None = None
+
+    def _env_scope_outside_mask(self) -> torch.Tensor | None:
+        """Gaussians outside the env-scope sphere (3DGS-DR ``get_outside_msk``)."""
+        if self._env_scope_center is None or self._env_scope_radius_sq is None:
+            return None
+        dist_sq = torch.sum((self.model.gaussians.means - self._env_scope_center) ** 2, dim=-1)
+        return dist_sq > self._env_scope_radius_sq
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -251,6 +274,28 @@ class FasterGSTrainer(GuiTrainer):
                 f'densify until iter {self.DENSIFICATION_END_ITERATION}, '
                 f'opac_lr0_interval={dr_sched.OPAC_LR0_INTERVAL}'
             )
+            parity_flags = [
+                name
+                for name, enabled in (
+                    ('diffuse_bootstrap', dr_sched.PARITY_DIFFUSE_BOOTSTRAP),
+                    ('skip_vanilla_opacity_reset', dr_sched.PARITY_SKIP_VANILLA_OPACITY_RESET_DURING_PROP),
+                    ('propagation_after_init', dr_sched.PARITY_PROPAGATION_AFTER_INIT),
+                )
+                if enabled
+            ]
+            if parity_flags:
+                Logger.log_info(f'3DGS-DR parity flags: {", ".join(parity_flags)}')
+            if dr_sched.USE_ENV_SCOPE:
+                center = [float(c) for c in dr_sched.ENV_SCOPE_CENTER]
+                radius = float(dr_sched.ENV_SCOPE_RADIUS)
+                if radius <= 0.0:
+                    raise Framework.TrainingError('USE_ENV_SCOPE=True requires ENV_SCOPE_RADIUS > 0')
+                self._env_scope_center = torch.tensor(center, dtype=torch.float32, device='cuda')
+                self._env_scope_radius_sq = radius * radius
+                Logger.log_info(
+                    f'env scope active: center={center}, radius={radius:.4f}, '
+                    f'refl_mask_loss_weight={dr_sched.REFL_MASK_LOSS_WEIGHT}'
+                )
 
         self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
         normals_path = getattr(Framework.config.DATASET, 'EXTERNAL_NORMALS_PATH', None)
@@ -287,6 +332,17 @@ class FasterGSTrainer(GuiTrainer):
     def _set_opacity_lr(self, lr: float) -> None:
         """Sets the learning rate of the opacity optimizer group (DR propagation schedule)."""
         self.model.gaussians.set_opacity_lr(lr)
+
+    def _dr_propagation_window(self, iteration: int) -> bool:
+        """True when iteration is inside the 3DGS-DR normal-propagation maintenance window."""
+        if not self._dr_active:
+            return False
+        cfg = self.DEFERRED_REFLECTION_SCHEDULE
+        prop_end = cfg.PROPAGATION_END_ITERATION + cfg.LONGER_PROPAGATION_ITERATIONS
+        init_until = cfg.INIT_UNTIL_ITERATION
+        if cfg.PARITY_PROPAGATION_AFTER_INIT:
+            return init_until < iteration <= prop_end
+        return init_until <= iteration <= prop_end
 
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
@@ -328,24 +384,33 @@ class FasterGSTrainer(GuiTrainer):
         """
         if not self._dr_active or self._dr_specular_terminated:
             return
+        if not self._dr_propagation_window(iteration):
+            return
         cfg = self.DEFERRED_REFLECTION_SCHEDULE
         prop_end = cfg.PROPAGATION_END_ITERATION + cfg.LONGER_PROPAGATION_ITERATIONS
-        if iteration > prop_end:
-            return
+        outside_msk = self._env_scope_outside_mask()
 
         on_opacity_reset = iteration % self.OPACITY_RESET_INTERVAL == 0
         if on_opacity_reset:
             self.model.gaussians.dr_reset_opacity_floor(cfg.PROPAGATION_OPACITY_FLOOR)
-            self.model.gaussians.dr_bump_reflection_strength(cfg.PROPAGATION_MIN_REFLECTION)
+            self.model.gaussians.dr_bump_reflection_strength(
+                cfg.PROPAGATION_MIN_REFLECTION,
+                exclusive_msk=outside_msk,
+            )
         else:
-            self.model.gaussians.dr_reset_opacity_ceiling(cfg.PROPAGATION_MIN_OPACITY)
+            self.model.gaussians.dr_reset_opacity_ceiling(
+                cfg.PROPAGATION_MIN_OPACITY,
+                exclusive_msk=outside_msk,
+            )
             self.model.gaussians.color_sabotage(
                 refl_threshold=cfg.COLOR_SABOTAGE_THRESHOLD,
                 noise=cfg.COLOR_SABOTAGE_NOISE,
+                exclusive_msk=outside_msk,
             )
             self.model.gaussians.dr_enlarge_reflective_scales(
                 refl_threshold=cfg.SCALE_ENLARGE_THRESHOLD,
                 enlarge_scale=cfg.PROPAGATION_ENLARGE_SCALE,
+                exclusive_msk=outside_msk,
             )
             if cfg.OPAC_LR0_INTERVAL > 0 and iteration != prop_end:
                 self._set_opacity_lr(0.0)
@@ -436,9 +501,16 @@ class FasterGSTrainer(GuiTrainer):
 
     @training_callback(priority=90, start_iteration='OPACITY_RESET_INTERVAL', end_iteration='DENSIFICATION_END_ITERATION', iteration_stride='OPACITY_RESET_INTERVAL')
     @torch.no_grad()
-    def reset_opacities(self, *_) -> None:
+    def reset_opacities(self, iteration: int, *_) -> None:
         """Reset opacities."""
         if self._gaussian_ply_init_active and self.KEEP_THIN_SPLATS:
+            return
+        dr_cfg = self.DEFERRED_REFLECTION_SCHEDULE
+        if (
+            self._dr_active
+            and dr_cfg.PARITY_SKIP_VANILLA_OPACITY_RESET_DURING_PROP
+            and self._dr_propagation_window(iteration)
+        ):
             return
         if not self.USE_MCMC:
             self.model.gaussians.reset_opacities()
@@ -476,10 +548,17 @@ class FasterGSTrainer(GuiTrainer):
             )
         )
         bg_color = torch.rand_like(view.camera.background_color) if use_random_bg else view.camera.background_color
+        dr_sched = self.DEFERRED_REFLECTION_SCHEDULE
+        bootstrap_diffuse = (
+            self._dr_active
+            and dr_sched.PARITY_DIFFUSE_BOOTSTRAP
+            and iteration <= dr_sched.INIT_UNTIL_ITERATION
+        )
         render_out = self.renderer.render_image_training(
             view=view,
             update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
             bg_color=bg_color,
+            use_diffuse_bootstrap=bootstrap_diffuse,
         )
         image = render_out['rgb']
         # calculate loss
@@ -502,6 +581,36 @@ class FasterGSTrainer(GuiTrainer):
                 render_out['mesh_normal'],
                 render_out.get('mesh_normal_mask'),
             )
+        dr_cfg = self.model.DEFERRED_REFLECTION
+        force_albedo = bool(getattr(dr_cfg, 'FORCE_ALBEDO_BASE_COLOR', False))
+        refl_until = int(getattr(self.LOSS, 'REFL_PRIOR_UNTIL_ITERATION', 0) or 0)
+        if (
+            self.LOSS.LAMBDA_REFL_PRIOR > 0.0
+            and iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION
+            and (refl_until <= 0 or iteration <= refl_until)
+            and 'reflection_strength' in render_out
+            and 'mesh_metallic' in render_out
+        ):
+            loss = loss + self.loss.reflection_strength_prior_loss(
+                render_out['reflection_strength'],
+                render_out['mesh_metallic'],
+                render_out.get('mesh_metallic_mask'),
+            )
+        albedo_until = int(getattr(self.LOSS, 'ALBEDO_PRIOR_UNTIL_ITERATION', 0) or 0)
+        if (
+            not force_albedo
+            and self.LOSS.LAMBDA_ALBEDO_PRIOR > 0.0
+            and iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION
+            and (albedo_until <= 0 or iteration <= albedo_until)
+            and 'base_color' in render_out
+            and 'mesh_albedo' in render_out
+        ):
+            loss = loss + self.loss.albedo_prior_loss(
+                render_out['base_color'],
+                render_out['mesh_albedo'],
+                render_out.get('mesh_albedo_mask'),
+                render_out.get('mesh_metallic'),
+            )
         anchor_lambda = float(getattr(self.LOSS, 'LAMBDA_ENVMAP_ANCHOR', 0.0))
         if (
             anchor_lambda > 0.0
@@ -513,6 +622,16 @@ class FasterGSTrainer(GuiTrainer):
                 self.model.environment,
                 self._envmap_bake_snapshot,
             )
+        dr_sched = self.DEFERRED_REFLECTION_SCHEDULE
+        if (
+            self._dr_active
+            and dr_sched.USE_ENV_SCOPE
+            and iteration >= dr_sched.INIT_UNTIL_ITERATION
+        ):
+            outside_msk = self._env_scope_outside_mask()
+            if outside_msk is not None and outside_msk.any():
+                refls = self.model.gaussians.reflection_strength.flatten()
+                loss = loss + dr_sched.REFL_MASK_LOSS_WEIGHT * refls[outside_msk].mean()
         # backward
         loss.backward()
         # optimizer step
