@@ -60,12 +60,13 @@ class FasterGSLoss(BaseLoss):
     def reflection_strength_prior_loss(
         self,
         pred_refl: torch.Tensor,
-        target_metallic: torch.Tensor,
+        target_refl: torch.Tensor,
         target_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Pull screen-space reflection strength toward a mesh cue (gloss / metallic)."""
         if self._lambda_refl_prior <= 0.0:
             return pred_refl.new_zeros(())
-        target = target_metallic * self._refl_prior_scale
+        target = target_refl * self._refl_prior_scale
         if target_mask is None:
             return self._lambda_refl_prior * torch.nn.functional.l1_loss(pred_refl, target)
         weight = target_mask.squeeze(0) if target_mask.dim() == 3 else target_mask

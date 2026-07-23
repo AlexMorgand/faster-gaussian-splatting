@@ -77,8 +77,8 @@ def _training_extent_camera_position(view) -> torch.Tensor:
         LAMBDA_SCALE_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
         LAMBDA_NORMAL=0.0,  # mesh normal supervision (3DGS-DR default 0.1 when enabled)
         LAMBDA_ALBEDO_PRIOR=0.0,  # pull rasterized base_color toward mesh albedo (3DGS-DR default 0.02)
-        LAMBDA_REFL_PRIOR=0.0,  # pull reflection strength toward mesh metallic (3DGS-DR default 0.05)
-        REFL_PRIOR_SCALE=0.4,  # scale metallic target before reflection-strength prior
+        LAMBDA_REFL_PRIOR=0.0,  # pull reflection strength toward max(metallic, 1-roughness)
+        REFL_PRIOR_SCALE=0.4,  # scale refl target before reflection-strength prior
         LAMBDA_ENVMAP_ANCHOR=0.0,  # pull cubemap back toward HDRI bake (set when ENVMAP_HDRI is used)
         NORMAL_LOSS_UNTIL_ITERATION=0,  # 0 = no upper bound
         ALBEDO_PRIOR_UNTIL_ITERATION=0,
@@ -566,6 +566,15 @@ class FasterGSTrainer(GuiTrainer):
         rgb_gt = view.rgb
         if supervision_alpha is not None:
             rgb_gt = apply_background_color(rgb_gt, supervision_alpha, bg_color)
+        # Hybrid: do not fit fal RGB on hard-mirror pixels — HDRI/env owns those.
+        ignore_mirror_rgb = bool(
+            getattr(self.model.DEFERRED_REFLECTION, 'IGNORE_RGB_LOSS_ON_MIRROR', False)
+        )
+        if ignore_mirror_rgb and 'mirror_mask' in render_out and render_out['mirror_mask'] is not None:
+            mirror = render_out['mirror_mask']
+            if mirror.shape[0] == 1:
+                mirror = mirror.expand_as(rgb_gt)
+            rgb_gt = torch.where(mirror > 0.5, image.detach(), rgb_gt)
         loss = self.loss(image, rgb_gt)
         normal_until = int(getattr(self.LOSS, 'NORMAL_LOSS_UNTIL_ITERATION', 0) or 0)
         apply_normal_loss = (
@@ -589,12 +598,25 @@ class FasterGSTrainer(GuiTrainer):
             and iteration >= self.DEFERRED_REFLECTION_SCHEDULE.INIT_UNTIL_ITERATION
             and (refl_until <= 0 or iteration <= refl_until)
             and 'reflection_strength' in render_out
-            and 'mesh_metallic' in render_out
+            and (
+                'mesh_refl_target' in render_out
+                or 'mesh_metallic' in render_out
+            )
         ):
-            loss = loss + self.loss.reflection_strength_prior_loss(
-                render_out['reflection_strength'],
-                render_out['mesh_metallic'],
+            refl_target = render_out.get('mesh_refl_target', render_out.get('mesh_metallic'))
+            refl_mask = render_out.get(
+                'mesh_refl_target_mask',
                 render_out.get('mesh_metallic_mask'),
+            )
+            # Prior the soft Gaussian R (before hard-mirror override), so chrome learns R→1.
+            pred_refl = render_out.get(
+                'gaussian_reflection_strength',
+                render_out['reflection_strength'],
+            )
+            loss = loss + self.loss.reflection_strength_prior_loss(
+                pred_refl,
+                refl_target,
+                refl_mask,
             )
         albedo_until = int(getattr(self.LOSS, 'ALBEDO_PRIOR_UNTIL_ITERATION', 0) or 0)
         if (

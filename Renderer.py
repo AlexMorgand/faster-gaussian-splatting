@@ -171,6 +171,18 @@ class FasterGSRenderer(BaseRenderer):
             mask = mask.unsqueeze(0)
         return mesh_metallic * mask, mask
 
+    def _mesh_roughness_terms(self, view: View) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        mesh_roughness = view.mesh_roughness
+        if mesh_roughness is None:
+            return None, None
+        mask = view.segmentation
+        if mask is None:
+            mask = gbuffer_foreground_mask(mesh_roughness)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        # Keep raw roughness (do not FG-multiply): gloss = 1 - roughness needs true values.
+        return mesh_roughness, mask
+
     def _compose_deferred(
         self,
         base_image: torch.Tensor,
@@ -179,10 +191,19 @@ class FasterGSRenderer(BaseRenderer):
     ) -> dict[str, torch.Tensor]:
         mesh_normal, mesh_mask = self._mesh_normal_terms(view)
         mesh_albedo, albedo_mask = self._mesh_albedo_terms(view)
+        mesh_metallic, metallic_mask = self._mesh_metallic_terms(view)
+        mesh_roughness, roughness_mask = self._mesh_roughness_terms(view)
+        # Prefer metallic FG mask; fall back to roughness FG for gloss-only packs.
+        mirror_fg = metallic_mask if metallic_mask is not None else roughness_mask
         hijack = mesh_normal is not None and bool(
             getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'MESH_NORMAL_HIJACK', True)
         )
         force_albedo = bool(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'FORCE_ALBEDO_BASE_COLOR', False))
+        hard_mirror = bool(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'HARD_MIRROR_FROM_METALLIC', False))
+        hard_thr = float(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'HARD_MIRROR_THRESHOLD', 0.5))
+        gloss_thr = float(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'HARD_MIRROR_GLOSS_THRESHOLD', 0.9))
+        min_albedo = float(getattr(Framework.config.MODEL.DEFERRED_REFLECTION, 'HARD_MIRROR_MIN_ALBEDO', 0.0))
+        dr = Framework.config.MODEL.DEFERRED_REFLECTION
         return compose_deferred(
             base_image,
             feature_map,
@@ -194,6 +215,20 @@ class FasterGSRenderer(BaseRenderer):
             mesh_albedo_map=mesh_albedo,
             mesh_albedo_mask=albedo_mask,
             force_albedo_base_color=force_albedo,
+            mesh_metallic_map=mesh_metallic,
+            mesh_metallic_mask=mirror_fg,
+            mesh_roughness_map=mesh_roughness,
+            hard_mirror_from_metallic=hard_mirror,
+            hard_mirror_threshold=hard_thr,
+            hard_mirror_gloss_threshold=gloss_thr,
+            hard_mirror_min_albedo=min_albedo,
+            soft_specular_use=bool(getattr(dr, 'SOFT_SPECULAR_USE', False)),
+            soft_specular_max_albedo=float(getattr(dr, 'SOFT_SPECULAR_MAX_ALBEDO', 0.28)),
+            soft_specular_gloss_threshold=float(getattr(dr, 'SOFT_SPECULAR_GLOSS_THRESHOLD', 0.7)),
+            soft_specular_refl_scale=float(getattr(dr, 'SOFT_SPECULAR_REFL_SCALE', 0.55)),
+            soft_specular_refl_max=float(getattr(dr, 'SOFT_SPECULAR_REFL_MAX', 0.55)),
+            soft_specular_use_albedo_base=bool(getattr(dr, 'SOFT_SPECULAR_USE_ALBEDO_BASE', True)),
+            soft_specular_prior=float(getattr(dr, 'SOFT_SPECULAR_PRIOR', 0.45)),
         )
 
     def render_image_training(
@@ -245,7 +280,13 @@ class FasterGSRenderer(BaseRenderer):
         if decomposition is not None:
             outputs['base_color'] = decomposition['base_color']
             outputs['reflection_strength'] = decomposition['reflection_strength']
+            if decomposition.get('gaussian_reflection_strength') is not None:
+                outputs['gaussian_reflection_strength'] = decomposition['gaussian_reflection_strength']
             outputs['gaussian_normal'] = decomposition['gaussian_normal']
+            if decomposition.get('mirror_mask') is not None:
+                outputs['mirror_mask'] = decomposition['mirror_mask']
+            if decomposition.get('soft_specular_mask') is not None:
+                outputs['soft_specular_mask'] = decomposition['soft_specular_mask']
             if decomposition['mesh_normal'] is not None:
                 outputs['mesh_normal'] = decomposition['mesh_normal']
                 outputs['mesh_normal_mask'] = decomposition['mesh_normal_mask']
@@ -256,6 +297,18 @@ class FasterGSRenderer(BaseRenderer):
             if mesh_metallic is not None:
                 outputs['mesh_metallic'] = mesh_metallic
                 outputs['mesh_metallic_mask'] = mesh_metallic_mask
+            mesh_roughness, mesh_roughness_mask = self._mesh_roughness_terms(view)
+            if mesh_roughness is not None:
+                outputs['mesh_roughness'] = mesh_roughness
+                outputs['mesh_roughness_mask'] = mesh_roughness_mask
+            if decomposition.get('mesh_gloss') is not None:
+                outputs['mesh_gloss'] = decomposition['mesh_gloss']
+            if decomposition.get('mesh_refl_target') is not None:
+                outputs['mesh_refl_target'] = decomposition['mesh_refl_target']
+                if mesh_metallic_mask is not None:
+                    outputs['mesh_refl_target_mask'] = mesh_metallic_mask
+                elif mesh_roughness_mask is not None:
+                    outputs['mesh_refl_target_mask'] = mesh_roughness_mask
         return outputs
 
     @torch.no_grad()

@@ -1013,6 +1013,23 @@ class Gaussians(torch.nn.Module):
         ENVMAP_RESOLUTION=256,
         MESH_NORMAL_HIJACK=False,
         FORCE_ALBEDO_BASE_COLOR=False,
+        # Hard hybrid: bright metal/gloss → pure envmap (R=1).
+        # HARD_MIRROR_MIN_ALBEDO also gates the metallic cue (painted surfaces often bake metallic≈1).
+        HARD_MIRROR_FROM_METALLIC=False,
+        HARD_MIRROR_THRESHOLD=0.5,
+        HARD_MIRROR_GLOSS_THRESHOLD=0.9,
+        # Gloss/metallic hard mirrors also require albedo luma >= this (0 = disabled).
+        HARD_MIRROR_MIN_ALBEDO=0.0,
+        # Dark/mid glossy (black leather): keep albedo base, cap R so color shows under env.
+        SOFT_SPECULAR_USE=False,
+        SOFT_SPECULAR_MAX_ALBEDO=0.28,
+        SOFT_SPECULAR_GLOSS_THRESHOLD=0.7,
+        SOFT_SPECULAR_REFL_SCALE=0.55,
+        SOFT_SPECULAR_REFL_MAX=0.55,
+        SOFT_SPECULAR_USE_ALBEDO_BASE=True,
+        SOFT_SPECULAR_PRIOR=0.45,
+        # Do not fit fal RGB on hard-mirror pixels only (intermediate still trusts fal color).
+        IGNORE_RGB_LOSS_ON_MIRROR=False,
         ENVMAP_HDRI=None,
         ENVMAP_EXPOSURE=1.0,
         ENVMAP_YAW_DEG=0.0,
