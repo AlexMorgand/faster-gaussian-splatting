@@ -1,5 +1,7 @@
 """FasterGS/Trainer.py"""
 
+from pathlib import Path
+
 import torch
 
 import Framework
