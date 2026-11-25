@@ -99,27 +99,39 @@ class FasterGS2DRenderer(FasterGSRenderer):
         options = {}
         if output_channels != RenderLayout.DISTORTION and hasattr(_C, "disk_forward_channels"):
             options["output_channels"] = output_channels
+        scales = g.raw_scales
+        if scale_modifier != 1.0:
+            scales = scales + math.log(max(scale_modifier, 1e-6))
         rendered = diff_rasterize_disks(
-            g.means, g.raw_scales + math.log(max(scale_modifier, 1e-6)),
+            g.means, scales,
             g.raw_rotations, g.raw_opacities, sh0, rest,
             settings, image_shift=shift, return_metadata=collect, **options)
         output, metadata = rendered if collect else (rendered, None)
         return output, shift, metadata
 
-    def _parse(self, view, output, compute_surf_normal):
+    def _parse(self, view, output, compute_surf_normal, rgb_only=False):
         rgb, z, alpha, raw_normal, median, distortion = output.split((3, 1, 1, 3, 1, 1), dim=0)
-        expected = (z/alpha.clamp_min(1e-8)).nan_to_num(0)
-        depth = expected*(1-self.DEPTH_RATIO) + median*self.DEPTH_RATIO
-        normal = F.normalize(raw_normal, dim=0, eps=1e-8)
-        unit_surface = depth_to_normal(view, depth) if compute_surf_normal else torch.zeros_like(normal)
-        surface = unit_surface * alpha.detach() if compute_surf_normal else unit_surface
+        if rgb_only:
+            # The RGB kernel already zeroes every auxiliary plane.
+            depth, normal = z, raw_normal
+            unit_surface = surface = raw_normal.detach()
+        else:
+            depth = median
+            if self.DEPTH_RATIO < 1:
+                depth = (z / alpha.clamp_min(1e-8)).nan_to_num(0)
+                if self.DEPTH_RATIO > 0:
+                    depth = depth * (1 - self.DEPTH_RATIO) + median * self.DEPTH_RATIO
+            normal = F.normalize(raw_normal, dim=0, eps=1e-8)
+            unit_surface = depth_to_normal(view, depth) if compute_surf_normal else torch.zeros_like(normal)
+            surface = unit_surface * alpha.detach() if compute_surf_normal else unit_surface
         return {"rgb": rgb, "rend_alpha": alpha, "surf_depth": depth, "rend_normal": normal,
                 "surf_normal": surface, "weighted_disk_normal": raw_normal,
                 "unit_surface_normal": unit_surface, "rend_dist": distortion}
 
     def render_image_training(self, view, update_densification_info, bg_color, compute_surf_normal=True, output_channels=RenderLayout.DISTORTION):
         output, shift, metadata = self._rasterize(view, bg_color, update_densification_info, output_channels=output_channels)
-        return {**self._parse(view, output, compute_surf_normal),
+        rgb_only = output_channels == RenderLayout.RGB and not compute_surf_normal and hasattr(_C, "disk_forward_channels")
+        return {**self._parse(view, output, compute_surf_normal, rgb_only),
                 "image_shift": shift, "metadata": metadata}
 
     @torch.no_grad()

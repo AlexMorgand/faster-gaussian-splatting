@@ -75,15 +75,18 @@ class Gaussians2D(Gaussians):
             or shift_grad.shape != (len(self._means), 2) or metadata.shape != (2, len(self._means))):
             raise Framework.ModelError("FasterGS2D requires Nx2 pixel-shift gradients and 2xN visibility/radius metadata")
         visible = metadata[1] > 0
-        if not torch.isfinite(shift_grad).all() or not torch.isfinite(metadata[:, visible]).all():
-            raise Framework.ModelError("FasterGS2D nonfinite densification state")
-        ndc_grad = shift_grad.detach()*shift_grad.new_tensor([width/2, height/2])
+        ndc_grad = shift_grad.detach() * shift_grad.new_tensor([width / 2, height / 2])
         score = ndc_grad.norm(dim=1)
-        if not torch.isfinite(score[visible]).all():
-            raise Framework.ModelError("FasterGS2D nonfinite NDC densification score")
-        self._densification_info[0].add_(visible | (metadata[0] > 0))
-        self._densification_info[1, visible] += score[visible]
-        self._max_radii2D[visible] = torch.maximum(self._max_radii2D[visible], metadata[0, visible])
+        radius = metadata[0]
+        finite = torch.isfinite(shift_grad).all() & (
+            ~visible | (torch.isfinite(radius) & torch.isfinite(metadata[1]) & torch.isfinite(score))
+        ).all()
+        if not finite:
+            raise Framework.ModelError("FasterGS2D nonfinite NDC score or densification state")
+
+        self._densification_info[0].add_(visible | (radius > 0))
+        self._densification_info[1].add_(torch.where(visible, score, 0.0))
+        torch.maximum(self._max_radii2D, torch.where(visible, radius, self._max_radii2D), out=self._max_radii2D)
 
     def setup_3d_filter(self, *args, **kwargs):
         raise Framework.ModelError("FasterGS2D does not support 3D filters")

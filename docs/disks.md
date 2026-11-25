@@ -86,6 +86,19 @@ A stock run took 254.9 seconds with 4.15 million 3D Gaussians. The single
 checkpoint timings describe that training stage only. Wall time also includes
 backward, optimization, topology changes and checkpointing.
 
+The disk trainer also avoids per-step gathers of visible disks. It accumulates
+scores and maximum radii with a visibility mask and still counts occluded
+disks with projected support in the denominator. At Garden iteration 12k
+(3.02 million disks), this update averaged 0.473 ms versus 0.812 ms across
+54 paired measurements on nine views. All three statistics matched exactly
+on those views. RGB-only training also reuses the zero auxiliary planes, and
+unit scale and unmixed depth use their source tensors directly.
+
+With these changes, a separate pair of 30k Garden runs took 333.0 and 327.7
+seconds after prefetch, with checkpoint writes disabled. Mean PSNR across
+24 held-out views was 26.990 and 26.999 dB respectively. This comparison
+includes backward, density control and Adam. Each timing is one run.
+
 ## Build and checks
 
 Use the normal documented NeRFICG/FasterGS prerequisites and matching CUDA

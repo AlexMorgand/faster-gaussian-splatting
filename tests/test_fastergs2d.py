@@ -14,7 +14,7 @@ from Methods.FasterGS.Model import FasterGSModel, Gaussians
 from Methods.FasterGS.Trainer import FasterGSTrainer
 from Methods.FasterGS.disks.Loss import FasterGS2DLoss, normal_loss, per_disk_normal_loss
 from Methods.FasterGS.disks.Model import FasterGS2DModel, Gaussians2D
-from Methods.FasterGS.disks.Renderer import depth_to_normal
+from Methods.FasterGS.disks.Renderer import FasterGS2DRenderer, depth_to_normal
 from Methods.FasterGS.disks.Trainer import FasterGS2DTrainer
 
 
@@ -146,6 +146,24 @@ class FasterGS2DTest(unittest.TestCase):
             torch.testing.assert_close(grad, -surface.detach()*alpha/35)
         with self.assertRaisesRegex(Framework.RendererError, "at least a 3x3"):
             depth_to_normal(view, depth[:, :2])
+
+    def test_depth_mix_endpoints_and_rgb_only_layout(self):
+        output = torch.rand(10, 4, 5, requires_grad=True)
+        for ratio in (0.0, 0.4, 1.0):
+            renderer = SimpleNamespace(DEPTH_RATIO=ratio)
+            depth = FasterGS2DRenderer._parse(renderer, None, output, False)["surf_depth"]
+            expected = (1 - ratio) * output[3:4] / output[4:5] + ratio * output[8:9]
+            torch.testing.assert_close(depth, expected)
+            actual_grad, = torch.autograd.grad(depth.sum(), output)
+            expected_grad, = torch.autograd.grad(expected.sum(), output)
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+        rgb_output = torch.cat((output[:3], output.new_zeros(7, 4, 5)))
+        reference = FasterGS2DRenderer._parse(renderer, None, rgb_output, False)
+        fast = FasterGS2DRenderer._parse(renderer, None, rgb_output, False, rgb_only=True)
+        for name in reference:
+            torch.testing.assert_close(fast[name], reference[name], atol=0, rtol=0)
+            self.assertEqual(fast[name].requires_grad, reference[name].requires_grad)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for the fused depth adjoint")
     def test_depth_difference_adjoint(self):
