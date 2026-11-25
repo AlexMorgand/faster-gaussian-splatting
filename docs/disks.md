@@ -109,6 +109,14 @@ seconds after prefetch, with checkpoint writes disabled. Mean PSNR across
 24 held-out views was 26.990 and 26.999 dB respectively. This comparison
 includes backward, density control and Adam. Each timing is one run.
 
+For fixed FP32 training cameras, a CUDA kernel unprojects the four neighbors
+of each interior pixel and writes the two world-space differences directly.
+The renderer reuses the pose uploaded for rasterization. The normal loss and
+the depth-difference adjoint are shared with the original path. On nine Garden
+views at 27k, normalized supervision increased a full step from 11.80 to
+13.41 ms. Fusing the differences and reusing the pose reduced it to 12.90 ms.
+These timings use a fixed checkpoint on an RTX 5090 with distortion disabled.
+
 ## Build and checks
 
 Use the normal documented NeRFICG/FasterGS prerequisites and matching CUDA

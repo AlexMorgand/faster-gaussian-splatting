@@ -15,6 +15,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward", &rasterization_api::backward_wrapper);
     m.def("disk_forward", &rasterization_api::disk_forward_wrapper);
     m.def("disk_forward_channels", &rasterization_api::disk_forward_channels_wrapper);
+    m.def("depth_difference_forward", &rasterization_api::depth_difference_forward_wrapper);
     m.def("depth_difference_backward", &rasterization_api::depth_difference_backward_wrapper);
     m.def("disk_backward", &rasterization_api::disk_backward_wrapper);
     m.def("inference", &rasterization_api::inference_wrapper);

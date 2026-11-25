@@ -978,6 +978,34 @@ std::vector<torch::Tensor> disk_backward_wrapper(
     return {gm,gs,gq,go,g0,gr,gshift};
 }
 namespace {
+// Match the FP32 matrix product's accumulation order and its separate translation.
+// Near-coincident points can lose the surface normal if these operations are reassociated.
+__device__ float3 unproject_pixel(const float* depth, const float* rx, const float* ry,
+    const float* rotation, const float* position, int x, int y, int w) {
+    const float z = depth[y * w + x];
+    const float px = rx[x] * z, py = ry[y] * z;
+    float xyz[3];
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const float* row = rotation + 3 * i;
+        const float xy = __fmaf_rn(py, row[1], __fmul_rn(px, row[0]));
+        xyz[i] = __fadd_rn(__fmaf_rn(z, row[2], xy), position[i]);
+    }
+    return make_float3(xyz[0], xyz[1], xyz[2]);
+}
+
+__global__ void depth_difference_forward(const float* depth, const float* rx, const float* ry,
+    const float* rotation, const float* position, float3* vertical, float3* horizontal, int h, int w) {
+    const int x = 1 + blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = 1 + blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w - 1 || y >= h - 1) return;
+    const int i = (y - 1) * (w - 2) + x - 1;
+    vertical[i] = unproject_pixel(depth, rx, ry, rotation, position, x, y + 1, w)
+                - unproject_pixel(depth, rx, ry, rotation, position, x, y - 1, w);
+    horizontal[i] = unproject_pixel(depth, rx, ry, rotation, position, x + 1, y, w)
+                  - unproject_pixel(depth, rx, ry, rotation, position, x - 1, y, w);
+}
+
 // Each depth contributes to at most four interior difference vectors. Gather
 // their adjoints at that pixel instead of scattering into four full images.
 __global__ void depth_difference_backward(const float3* vertical, const float3* horizontal,
@@ -1001,6 +1029,24 @@ __global__ void depth_difference_backward(const float3* vertical, const float3* 
     const float dz = g.x * rotation[2] + g.y * rotation[5] + g.z * rotation[8];
     depth[y * w + x] = dz + dy * ry[y] + dx * rx[x];
 }
+}
+
+std::vector<torch::Tensor> depth_difference_forward_wrapper(const torch::Tensor& depth,
+    const torch::Tensor& rx, const torch::Tensor& ry, const torch::Tensor& rotation, const torch::Tensor& position) {
+    for (const auto& t : {depth, rx, ry, rotation, position}) check_tensor(t, depth, "depth difference input");
+    const auto h = ry.numel(), w = rx.numel();
+    TORCH_CHECK(rx.dim() == 1 && ry.dim() == 1 && w >= 3 && h >= 3 && w <= 65520 && h <= 65520
+        && w*h <= INT_MAX && depth.sizes() == torch::IntArrayRef({h,w})
+        && rotation.sizes() == torch::IntArrayRef({3,3}) && position.sizes() == torch::IntArrayRef({3}),
+        "invalid depth difference tensors");
+    const at::cuda::CUDAGuard guard(depth.device());
+    auto vertical = torch::empty({h-2,w-2,3}, depth.options()), horizontal = torch::empty_like(vertical);
+    depth_difference_forward<<<dim3(div_round_up(int(w)-2,32),div_round_up(int(h)-2,8)), dim3(32,8), 0,
+        at::cuda::getCurrentCUDAStream()>>>(depth.data_ptr<float>(), rx.data_ptr<float>(), ry.data_ptr<float>(),
+        rotation.data_ptr<float>(), position.data_ptr<float>(), reinterpret_cast<float3*>(vertical.data_ptr<float>()),
+        reinterpret_cast<float3*>(horizontal.data_ptr<float>()), h, w);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {vertical,horizontal};
 }
 
 torch::Tensor depth_difference_backward_wrapper(const torch::Tensor& vertical, const torch::Tensor& horizontal,

@@ -170,7 +170,7 @@ class FasterGS2DTest(unittest.TestCase):
         from Methods.FasterGS.disks.Renderer import _FixedCameraDifferences, _world_differences
         device = torch.device("cuda")
         generator = torch.Generator(device=device).manual_seed(17)
-        for h, w in ((3, 3), (3, 11), (7, 4), (19, 37)):
+        for h, w in ((3, 3), (3, 11), (7, 4), (19, 37), (33, 67)):
             rand = lambda *shape: torch.randn(shape, device=device, generator=generator)
             z = rand(h, w).requires_grad_()
             args = (z, rand(w), rand(h), rand(3, 3).T, rand(3))

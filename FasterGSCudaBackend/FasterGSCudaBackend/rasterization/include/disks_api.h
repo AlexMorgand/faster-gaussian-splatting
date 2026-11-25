@@ -34,6 +34,8 @@ std::vector<torch::Tensor> disk_backward_wrapper(
     int selector, float focal_x, float focal_y, float center_x, float center_y,
     float near_plane, float far_plane);
 
+std::vector<torch::Tensor> depth_difference_forward_wrapper(const torch::Tensor& depth,
+    const torch::Tensor& rx, const torch::Tensor& ry, const torch::Tensor& rotation, const torch::Tensor& position);
 torch::Tensor depth_difference_backward_wrapper(const torch::Tensor& vertical, const torch::Tensor& horizontal,
     const torch::Tensor& rx, const torch::Tensor& ry, const torch::Tensor& rotation);
 }

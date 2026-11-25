@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 import Framework
+from Datasets.utils import View
 from FasterGSCudaBackend import _C
 from FasterGSCudaBackend.torch_bindings.disks import diff_rasterize_disks
 from Methods.Base.Renderer import BaseRenderer
@@ -37,6 +38,9 @@ class _FixedCameraDifferences(torch.autograd.Function):
     @staticmethod
     def forward(ctx, z, rx, ry, rotation, position):
         ctx.save_for_backward(rx, ry, rotation)
+        # Small matrix products can use a different FP32 reduction order in cuBLAS.
+        if z.numel() >= 1024 and hasattr(_C, "depth_difference_forward"):
+            return tuple(_C.depth_difference_forward(z.contiguous(), rx, ry, rotation.contiguous(), position.contiguous()))
         return _world_differences(z, rx, ry, rotation, position)
 
     @staticmethod
@@ -53,14 +57,14 @@ class _FixedCameraDifferences(torch.autograd.Function):
         return depth, None, None, None, None
 
 
-def depth_to_normal(view, depth):
+def depth_to_normal(view, depth, pose=None):
     z = depth[0]
     if min(z.shape) < 3:
         raise Framework.RendererError("FasterGS2D depth normal requires at least a 3x3 raster")
     camera = view.camera
     rx = (torch.arange(z.shape[1], device=z.device, dtype=z.dtype) + .5 - camera.center_x) / camera.focal_x
     ry = (torch.arange(z.shape[0], device=z.device, dtype=z.dtype) + .5 - camera.center_y) / camera.focal_y
-    rotation, position = view.rotation, view.position
+    rotation, position = (view.rotation, view.position) if pose is None else pose
     if (z.requires_grad and z.is_cuda and z.dtype == torch.float32 and hasattr(_C, "depth_difference_backward")
             and not any(t.requires_grad for t in (rx, ry, rotation, position)) and not torch.is_autocast_enabled()
             and not torch.backends.cuda.matmul.allow_tf32):
@@ -86,9 +90,10 @@ class FasterGS2DRenderer(FasterGSRenderer):
         if not 0 <= self.DEPTH_RATIO <= 1:
             raise Framework.RendererError("FasterGS2D DEPTH_RATIO must be in [0,1]")
 
-    def _rasterize(self, view, bg_color, collect=False, scale_modifier=1.0, output_channels=RenderLayout.DISTORTION):
+    def _rasterize(self, view, bg_color, collect=False, scale_modifier=1.0, output_channels=RenderLayout.DISTORTION, settings=None):
         g = self.model.gaussians
-        settings = extract_settings(view, g.active_sh_bases, bg_color, self.PROPER_ANTIALIASING)
+        if settings is None:
+            settings = extract_settings(view, g.active_sh_bases, bg_color, self.PROPER_ANTIALIASING)
         shift = g.means.new_zeros((len(g.means), 2), requires_grad=True) if collect else None
         sh0, rest = g.sh_coefficients_0, g.sh_coefficients_rest
         if not self.model.training:
@@ -109,7 +114,7 @@ class FasterGS2DRenderer(FasterGSRenderer):
         output, metadata = rendered if collect else (rendered, None)
         return output, shift, metadata
 
-    def _parse(self, view, output, compute_surf_normal, rgb_only=False):
+    def _parse(self, view, output, compute_surf_normal, rgb_only=False, pose=None):
         rgb, z, alpha, raw_normal, median, distortion = output.split((3, 1, 1, 3, 1, 1), dim=0)
         if rgb_only:
             # The RGB kernel already zeroes every auxiliary plane.
@@ -122,16 +127,21 @@ class FasterGS2DRenderer(FasterGSRenderer):
                 if self.DEPTH_RATIO > 0:
                     depth = depth * (1 - self.DEPTH_RATIO) + median * self.DEPTH_RATIO
             normal = F.normalize(raw_normal, dim=0, eps=1e-8)
-            unit_surface = depth_to_normal(view, depth) if compute_surf_normal else torch.zeros_like(normal)
+            unit_surface = depth_to_normal(view, depth, pose) if compute_surf_normal else torch.zeros_like(normal)
             surface = unit_surface * alpha.detach() if compute_surf_normal else unit_surface
         return {"rgb": rgb, "rend_alpha": alpha, "surf_depth": depth, "rend_normal": normal,
                 "surf_normal": surface, "weighted_disk_normal": raw_normal,
                 "unit_surface_normal": unit_surface, "rend_dist": distortion}
 
     def render_image_training(self, view, update_densification_info, bg_color, compute_surf_normal=True, output_channels=RenderLayout.DISTORTION):
-        output, shift, metadata = self._rasterize(view, bg_color, update_densification_info, output_channels=output_channels)
+        settings = extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING)
+        output, shift, metadata = self._rasterize(view, bg_color, update_densification_info,
+                                                 output_channels=output_channels, settings=settings)
+        # View constructs w2c with the transpose of its stored rotation. Reuse the
+        # uploaded pose so normal supervision does not synchronize to upload it again.
+        pose = (settings.w2c[:3, :3].T.contiguous(), settings.cam_position) if compute_surf_normal and type(view) is View else None
         rgb_only = output_channels == RenderLayout.RGB and not compute_surf_normal and hasattr(_C, "disk_forward_channels")
-        return {**self._parse(view, output, compute_surf_normal, rgb_only),
+        return {**self._parse(view, output, compute_surf_normal, rgb_only, pose),
                 "image_shift": shift, "metadata": metadata}
 
     @torch.no_grad()
