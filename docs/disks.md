@@ -71,7 +71,17 @@ an oriented plane. Three changes account for how the training path works today.
    densification ends. Preprocessing skips the support test for disks whose
    tile range is already empty.
 
-On a Garden checkpoint at 27k iterations, the last preprocessing and blending
+Each warp covers an 8×4 subtile and tests the projected disk bounds, including
+the screen-space low-pass footprint and two pixels of padding. A warp ballot
+lets all 32 pixels skip a disk that misses their subtile. Surviving disks
+retain their sorted order, and backward reads the same per-pixel hit masks.
+
+On nine training views per scene (RTX 5090), subtile rejection reduced mean
+forward blend time from 1.494 to 1.393 ms on Garden, 2.077 to 1.916 ms on
+Bicycle and 0.518 to 0.507 ms on Bonsai. These measurements use the 27k
+Garden checkpoint and the final 30k Bicycle and Bonsai checkpoints.
+
+On a Garden checkpoint at 27k iterations, the earlier preprocessing and blending
 changes reduced GPU kernel time as follows (milliseconds per profiled view).
 
 | Forward kernel | Previous disks | Revised disks | Stock 3D |

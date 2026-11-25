@@ -336,8 +336,12 @@ __global__ void disk_blend_staged(
     PrimitiveBuffers p, TileBuffers tiles, const uint* indices, uint* hit_masks,
     const float3* bg, float* image, DiskRasterization d, int width, int height)
 {
-    const int x = blockIdx.x * config::tile_width + threadIdx.x;
-    const int y = blockIdx.y * config::tile_height + threadIdx.y;
+    // Each warp covers an 8x4 subtile. Keep the saved hit masks in raster order for backward.
+    static_assert(config::tile_width == 16 && config::tile_height == 12);
+    const uint thread = threadIdx.y * config::tile_width + threadIdx.x;
+    const int lx = ((thread >> 5) % 2) * 8 + (thread % 8);
+    const int ly = ((thread >> 5) / 2) * 4 + ((thread % 32) / 8);
+    const int x = blockIdx.x * 16 + lx, y = blockIdx.y * 12 + ly;
     const int grid_width = div_round_up(width, config::tile_width);
     const int tile = blockIdx.y * grid_width + blockIdx.x;
     const uint2 range = tiles.instance_ranges[tile];
@@ -345,6 +349,7 @@ __global__ void disk_blend_staged(
     // The determinant scale and plane numerator are common to every pixel in the tile.
     __shared__ float2 fixed[batch_size];
     static_assert(batch_size % 32 == 0, "staged batches must contain whole hit-mask groups");
+    __shared__ ushort4 screen[batch_size];
     __shared__ Disk geometry[batch_size];
     __shared__ float3 colors[batch_size];
     __shared__ int ids[batch_size];
@@ -358,13 +363,14 @@ __global__ void disk_blend_staged(
     float T = 1, depth = 0, alpha = 0, median = 0, mean_depth = 0, central_moment = 0;
     float3 rgb = make_float3(0), normal = make_float3(0);
     uint processed = 0;
-    const size_t mask_base = disk_mask_index(range.x, tile);
+    const size_t mask_base = size_t(range.x / 32 + tile) * config::block_size_blend + ly * config::tile_width + lx;
     for (uint start = range.x; start < range.y; start += batch_size) {
         if (__syncthreads_and(done)) break;
         const uint count = min(batch_size, range.y - start);
         if (lane < count) {
             const int i = indices[start + lane];
             ids[lane] = i;
+            screen[lane] = p.screen_bounds[i];
             const Disk disk = d.geometry[i];
             geometry[lane] = disk;
             const float3 u = disk.tangent_u, v = disk.tangent_v;
@@ -376,14 +382,31 @@ __global__ void disk_blend_staged(
             if (growth && d.image_shift) shifts[lane] = d.image_shift[i];
         }
         __syncthreads();
+        const int local_x = blockIdx.x * 16 + ((lane >> 5) % 2) * 8;
+        const int local_y = blockIdx.y * 12 + ((lane >> 5) / 2) * 4;
+        // Expand the projected disk and screen-space low-pass support before rejection.
+        constexpr int padding = 2;
+        uint keep[2];
+        #pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            const int j = group * 32 + (lane & 31);
+            bool overlap = false;
+            if (j < count) {
+                const ushort4 box = screen[j];
+                overlap = int(box.x) <= local_x + 7 + padding && int(box.y) >= local_x - padding
+                       && int(box.z) <= local_y + 3 + padding && int(box.w) >= local_y - padding;
+            }
+            keep[group] = __ballot_sync(0xffffffffu, overlap);
+        }
         // Backward reads one 32-bit hit mask per pixel and group of disks.
         for (uint first = 0; !done && first < count; first += 32) {
             uint hits = 0;
-            const uint stop = min(first + 32, count);
+            const uint candidates = keep[first / 32];
             #pragma unroll 4
             for (uint bit = 0; bit < 32; ++bit) {
+                if (done || bit + first >= count) break;
+                if (!(candidates & (1u << bit))) continue;
                 const uint j = first + bit;
-                if (done || j >= stop) break;
                 const int i = ids[j];
                 const Disk disk = geometry[j];
                 float3 ray = base_ray;
