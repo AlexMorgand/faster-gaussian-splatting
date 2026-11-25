@@ -98,6 +98,22 @@ The `disks/` package implements the `FasterGS2D` method exposed by the matching
 NeRF-ICG branch. It uses the same CUDA extension as FasterGS. See the
 [disk rasterizer documentation](docs/disks.md).
 
+To export a colored mesh, install Open3D in the training environment and run
+from the NeRF-ICG root with the training config and checkpoint:
+
+```shell
+PYTHONPATH=src python -m Methods.FasterGS.disks.mesh config.yaml final.pt mesh.ply \
+    --voxel-size 0.025 --max-depth 14 --smooth 5
+```
+
+Distances are in checkpoint world units. These example values are from Barn.
+The exporter fuses expected depth from training views. For fine foreground
+geometry, pass `--sphere X Y Z R` in the same coordinate system and reduce
+the voxel size. A starting width of `R / 200` resolved the bicycle frame and
+bench slats in Mip-NeRF 360. The default truncation band is four voxels.
+The exporter requests observation weight 3 on Open3D builds that expose this
+setting and uses the built-in extraction policy on standard legacy builds.
+
 Installing one of our Faster-GS variants (e.g., `FasterGS4D`) from their respective branch can be achieved by
 ```shell
 # HTTPS
