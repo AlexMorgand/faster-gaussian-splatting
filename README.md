@@ -94,6 +94,10 @@ _Note: The framework determines on-the-fly what extra modules need to be install
 
 ### Variants
 
+The `disks/` package implements the `FasterGS2D` method exposed by the matching
+NeRF-ICG branch. It uses the same CUDA extension as FasterGS. See the
+[disk rasterizer documentation](docs/disks.md).
+
 Installing one of our Faster-GS variants (e.g., `FasterGS4D`) from their respective branch can be achieved by
 ```shell
 # HTTPS

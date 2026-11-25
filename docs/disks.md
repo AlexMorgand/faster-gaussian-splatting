@@ -105,3 +105,5 @@ Disk intersection mathematics and adjoints were independently implemented on
 FasterGS. The implementation reuses the project's Apache-2.0 sorting, buffers,
 quaternion and spherical-harmonic helpers. The disk path has no dependency on
 the Inria CUDA rasterizer.
+The `disks/` package supplies the training schedule and converts camera-space
+depth to world-space normals. NeRF-ICG exposes this package as `FasterGS2D`.
