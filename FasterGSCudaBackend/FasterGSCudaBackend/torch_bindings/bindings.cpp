@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include "rasterization_api.h"
+#include "disks_api.h"
 #include "adam.h"
 #include "filter3d.h"
 #include "densification_api.h"
@@ -12,6 +13,10 @@ namespace densification_api = faster_gs::densification;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &rasterization_api::forward_wrapper);
     m.def("backward", &rasterization_api::backward_wrapper);
+    m.def("disk_forward", &rasterization_api::disk_forward_wrapper);
+    m.def("disk_forward_channels", &rasterization_api::disk_forward_channels_wrapper);
+    m.def("depth_difference_backward", &rasterization_api::depth_difference_backward_wrapper);
+    m.def("disk_backward", &rasterization_api::disk_backward_wrapper);
     m.def("inference", &rasterization_api::inference_wrapper);
     m.def("pruning_scores", &rasterization_api::pruning_scores_wrapper);
     m.def("adam_step", &adam_api::adam_step_wrapper);
