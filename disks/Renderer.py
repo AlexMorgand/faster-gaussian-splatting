@@ -4,6 +4,7 @@ Adapted from MIT-licensed NeRF-ICG revision 57ddd49.
 Copyright (c) 2026 Moritz Kappel, Florian Hahlbohm, Timon Scholz. See LICENSE.
 """
 from copy import deepcopy
+from enum import IntEnum
 import math
 
 import torch
@@ -16,6 +17,14 @@ from Methods.Base.Renderer import BaseRenderer
 from Methods.FasterGS.Renderer import FasterGSRenderer, extract_settings
 from Methods.FasterGS.utils import rgb_to_sh0
 from .Model import FasterGS2DModel
+
+
+class RenderLayout(IntEnum):
+    """Channel prefixes supported by the disk blend kernels."""
+    RGB = 3
+    EXPECTED_DEPTH_NORMALS = 8
+    MEDIAN_DEPTH_NORMALS = 9
+    DISTORTION = 10
 
 
 def _world_differences(z, rx, ry, rotation, position):
@@ -77,7 +86,7 @@ class FasterGS2DRenderer(FasterGSRenderer):
         if not 0 <= self.DEPTH_RATIO <= 1:
             raise Framework.RendererError("FasterGS2D DEPTH_RATIO must be in [0,1]")
 
-    def _rasterize(self, view, bg_color, collect=False, scale_modifier=1.0, output_channels=10):
+    def _rasterize(self, view, bg_color, collect=False, scale_modifier=1.0, output_channels=RenderLayout.DISTORTION):
         g = self.model.gaussians
         settings = extract_settings(view, g.active_sh_bases, bg_color, self.PROPER_ANTIALIASING)
         shift = g.means.new_zeros((len(g.means), 2), requires_grad=True) if collect else None
@@ -88,7 +97,7 @@ class FasterGS2DRenderer(FasterGSRenderer):
             if not self.RENDER_SPECULAR:
                 rest = torch.zeros_like(rest)
         options = {}
-        if output_channels != 10 and hasattr(_C, "disk_forward_channels"):
+        if output_channels != RenderLayout.DISTORTION and hasattr(_C, "disk_forward_channels"):
             options["output_channels"] = output_channels
         rendered = diff_rasterize_disks(
             g.means, g.raw_scales + math.log(max(scale_modifier, 1e-6)),
@@ -106,14 +115,16 @@ class FasterGS2DRenderer(FasterGSRenderer):
         return {"rgb": rgb, "rend_alpha": alpha, "surf_depth": depth, "rend_normal": normal,
                 "surf_normal": surface, "rend_dist": distortion}
 
-    def render_image_training(self, view, update_densification_info, bg_color, compute_surf_normal=True, output_channels=10):
+    def render_image_training(self, view, update_densification_info, bg_color, compute_surf_normal=True, output_channels=RenderLayout.DISTORTION):
         output, shift, metadata = self._rasterize(view, bg_color, update_densification_info, output_channels=output_channels)
         return {**self._parse(view, output, compute_surf_normal),
                 "image_shift": shift, "metadata": metadata}
 
     @torch.no_grad()
     def render_image_inference(self, view, to_chw=False):
-        output, _, _ = self._rasterize(view, view.camera.background_color, scale_modifier=self.SCALE_MODIFIER)
+        layout = RenderLayout.MEDIAN_DEPTH_NORMALS if self.DEPTH_RATIO else RenderLayout.EXPECTED_DEPTH_NORMALS
+        output, _, _ = self._rasterize(view, view.camera.background_color, scale_modifier=self.SCALE_MODIFIER,
+                                       output_channels=layout)
         parsed = self._parse(view, output, False)
         rgb = parsed["rgb"].clamp(0, 1)
         normal = torch.where(parsed["rend_alpha"] > 1e-4, .5*parsed["rend_normal"]+.5,

@@ -112,7 +112,10 @@ geometry, pass `--sphere X Y Z R` in the same coordinate system and reduce
 the voxel size. A starting width of `R / 200` resolved the bicycle frame and
 bench slats in Mip-NeRF 360. The default truncation band is four voxels.
 The exporter requests observation weight 3 on Open3D builds that expose this
-setting and uses the built-in extraction policy on standard legacy builds.
+setting and uses the built-in extraction policy on standard legacy builds. For faster previews,
+use `--depth-stride 2` to discover TSDF blocks from every other depth pixel
+in each direction. Fusion inside those blocks still uses full-resolution depth.
+The default stride of one preserves thin and isolated surfaces.
 
 Installing one of our Faster-GS variants (e.g., `FasterGS4D`) from their respective branch can be achieved by
 ```shell

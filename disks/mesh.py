@@ -12,10 +12,10 @@ from Implementations import Datasets, Methods
 
 
 @torch.inference_mode()
-def fuse(renderer, views, voxel, truncation, max_depth, sphere):
+def fuse(renderer, views, voxel, truncation, max_depth, sphere, depth_stride=1):
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel, truncation, o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-        volume_unit_resolution=8, depth_sampling_stride=1,
+        volume_unit_resolution=8, depth_sampling_stride=depth_stride,
     )
     for view in views:
         camera = view.camera
@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--truncation', type=float, help='TSDF band in scene units (default: four voxels).')
     parser.add_argument('--sphere', type=float, nargs=4, metavar=('X', 'Y', 'Z', 'R'),
                         help='Restrict fusion to a world-space foreground sphere.')
+    parser.add_argument('--depth-stride', type=int, choices=(1, 2), default=1,
+                        help='Depth sampling stride for allocating TSDF blocks (2 speeds up previews).')
     parser.add_argument('--smooth', type=int, default=0, metavar='ITERATIONS', help='Taubin smoothing passes.')
     args = parser.parse_args()
     band = args.voxel_size * 4 if args.truncation is None else args.truncation
@@ -70,7 +72,7 @@ def main():
     model = Methods.get_model('FasterGS2D', checkpoint=str(args.checkpoint)).eval()
     renderer = Methods.get_renderer('FasterGS2D', model)
     renderer.DEPTH_RATIO = 0.0
-    volume = fuse(renderer, dataset.train(), args.voxel_size, band, args.max_depth, args.sphere)
+    volume = fuse(renderer, dataset.train(), args.voxel_size, band, args.max_depth, args.sphere, args.depth_stride)
     # Some Open3D builds expose a configurable observation threshold with a high default.
     try:
         mesh = volume.extract_triangle_mesh(weight_threshold=3.0)

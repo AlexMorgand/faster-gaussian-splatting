@@ -9,6 +9,7 @@ from Logging import Logger
 from Methods.Base.utils import pre_training_callback, training_callback, post_training_callback
 from Methods.FasterGS.Trainer import FasterGSTrainer
 from .Loss import FasterGS2DLoss
+from .Renderer import RenderLayout
 
 
 class FasterGS2DTrainer(FasterGSTrainer):
@@ -98,13 +99,13 @@ class FasterGS2DTrainer(FasterGSTrainer):
         use_normal = normal_active and self.loss.base_normal > 0
         use_distortion = iteration > self.DISTORTION_START_ITERATION and self.loss.base_distortion > 0
         if use_distortion:
-            channels = 10
+            layout = RenderLayout.DISTORTION
         elif use_normal:
-            channels = 9 if self.renderer.DEPTH_RATIO > 0 else 8
+            layout = RenderLayout.MEDIAN_DEPTH_NORMALS if self.renderer.DEPTH_RATIO > 0 else RenderLayout.EXPECTED_DEPTH_NORMALS
         else:
-            channels = 3
+            layout = RenderLayout.RGB
         return self.renderer.render_image_training(
-            view, collect, bg_color, compute_surf_normal=use_normal, output_channels=channels)
+            view, collect, bg_color, compute_surf_normal=use_normal, output_channels=layout)
 
     @torch.no_grad()
     def _after_backward(self, iteration, dataset, view, rendered, collect):
