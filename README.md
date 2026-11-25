@@ -117,6 +117,12 @@ use `--depth-stride 2` to discover TSDF blocks from every other depth pixel
 in each direction. Fusion inside those blocks still uses full-resolution depth.
 The default stride of one preserves thin and isolated surfaces.
 
+For captures that keep the subject near the image center, use
+`--auto-foreground --max-depth D`. A coarse fusion of every third view finds
+surfaces repeatedly framed near the center. The exporter prints the inferred
+sphere and voxel width, then fuses all training views within that sphere.
+Supply `--voxel-size` to override the inferred width.
+
 Installing one of our Faster-GS variants (e.g., `FasterGS4D`) from their respective branch can be achieved by
 ```shell
 # HTTPS
