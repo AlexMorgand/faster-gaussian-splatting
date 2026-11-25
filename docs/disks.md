@@ -3,6 +3,22 @@
 The disk entry point, `diff_rasterize_disks`, renders primitives with two
 log-scales and a quaternion defining the tangent plane.
 
+## From the paper to FasterGS
+
+| Part of 2DGS | Implementation in FasterGS |
+| --- | --- |
+| Oriented disk and perspective splatting (§4) | `Gaussians2D` stores two tangent scales and inherits the FasterGS rotation, opacity and appearance parameters. The CUDA renderer solves for the pixel ray's intersection in disk coordinates and applies the screen-space lowpass. FasterGS supplies depth sorting and tile binning. |
+| Depth distortion (§5, Appendix A) | The blend kernel accumulates the squared mapped-depth form of Eq. 17 using weighted moments. The Garden recipe sets its loss weight to zero. |
+| Normal consistency (§5, Eqs. 14–15) | `disks/Renderer.py` unprojects depth and takes finite differences to obtain a surface normal. The default loss compares it with the normalized sum of weighted disk normals and scales the dot product by detached accumulated opacity. Set `TRAINING.LOSS.NORMAL_LOSS_MODE: per_disk` to use Eq. 14. It computes accumulated opacity minus the dot product of the unnormalized weighted disk normals with the unit surface normal, preserving gradients through the blending weights. These objectives can produce different gradients where disks disagree. Garden uses expected depth and enables this term after iteration 7000. |
+| Adaptive density control (§6.1) | The paper projects the 3D center gradient onto the screen. Our renderer differentiates a 2D pixel shift, converts its gradient to normalized device coordinates and averages over views with projected support. The calibrated score feeds FasterGS's shared clone, split and prune operations. |
+
+The stock FasterGS trainer owns sampling, photometric loss evaluation, backward
+and Adam. The disk trainer selects the required render outputs and updates disk
+density statistics between backward and Adam. The hit masks and channel
+specializations below implement those choices in CUDA.
+
+Equation and section numbers refer to the [2DGS paper](https://arxiv.org/html/2403.17888).
+
 ## Math and API
 
 For camera-space centre C, scaled tangents U,V and pinhole ray r with r.z=1,

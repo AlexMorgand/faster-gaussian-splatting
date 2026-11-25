@@ -111,9 +111,11 @@ class FasterGS2DRenderer(FasterGSRenderer):
         expected = (z/alpha.clamp_min(1e-8)).nan_to_num(0)
         depth = expected*(1-self.DEPTH_RATIO) + median*self.DEPTH_RATIO
         normal = F.normalize(raw_normal, dim=0, eps=1e-8)
-        surface = depth_to_normal(view, depth)*alpha.detach() if compute_surf_normal else torch.zeros_like(normal)
+        unit_surface = depth_to_normal(view, depth) if compute_surf_normal else torch.zeros_like(normal)
+        surface = unit_surface * alpha.detach() if compute_surf_normal else unit_surface
         return {"rgb": rgb, "rend_alpha": alpha, "surf_depth": depth, "rend_normal": normal,
-                "surf_normal": surface, "rend_dist": distortion}
+                "surf_normal": surface, "weighted_disk_normal": raw_normal,
+                "unit_surface_normal": unit_surface, "rend_dist": distortion}
 
     def render_image_training(self, view, update_densification_info, bg_color, compute_surf_normal=True, output_channels=RenderLayout.DISTORTION):
         output, shift, metadata = self._rasterize(view, bg_color, update_densification_info, output_channels=output_channels)

@@ -12,7 +12,7 @@ import torch
 import Framework
 from Methods.FasterGS.Model import FasterGSModel, Gaussians
 from Methods.FasterGS.Trainer import FasterGSTrainer
-from Methods.FasterGS.disks.Loss import FasterGS2DLoss, normal_loss
+from Methods.FasterGS.disks.Loss import FasterGS2DLoss, normal_loss, per_disk_normal_loss
 from Methods.FasterGS.disks.Model import FasterGS2DModel, Gaussians2D
 from Methods.FasterGS.disks.Renderer import depth_to_normal
 from Methods.FasterGS.disks.Trainer import FasterGS2DTrainer
@@ -113,6 +113,20 @@ class FasterGS2DTest(unittest.TestCase):
             torch.testing.assert_close(dist.grad, torch.full_like(dist, .1/9))
             torch.testing.assert_close(rendered.grad, torch.full_like(rendered, -.05/9))
             self.assertFalse(hasattr(objective, "pkg"))
+
+    def test_eq14_matches_explicit_disk_sum_and_gradients(self):
+        # Two disks tilt in opposite directions. Their blended direction aligns
+        # with the surface, even though neither disk does.
+        weights = torch.tensor([.3, .3], dtype=torch.float64, requires_grad=True)
+        normals = torch.tensor([[.6, 0., .8], [-.6, 0., .8]], dtype=torch.float64, requires_grad=True)
+        surface = torch.tensor([0., 0., 1.], dtype=torch.float64, requires_grad=True)
+        weighted = (weights[:, None] * normals).sum(0)
+        actual = per_disk_normal_loss(weights.sum().reshape(1, 1, 1), weighted[:, None, None], surface[:, None, None])
+        reference = (weights * (1 - normals @ surface)).sum()
+        torch.testing.assert_close(actual, reference)
+        for grad, expected in zip(torch.autograd.grad(actual, (weights, normals, surface)),
+                                  torch.autograd.grad(reference, (weights, normals, surface))):
+            torch.testing.assert_close(grad, expected)
 
     def test_calibrated_normal_and_detached_alpha_policy(self):
         camera = SimpleNamespace(focal_x=11., focal_y=13., center_x=2.3, center_y=3.1)

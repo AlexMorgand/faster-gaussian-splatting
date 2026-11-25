@@ -6,20 +6,23 @@ import torch
 
 import Framework
 from Logging import Logger
-from Methods.Base.utils import pre_training_callback, training_callback, post_training_callback
+from Methods.Base.utils import pre_training_callback, post_training_callback
 from Methods.FasterGS.Trainer import FasterGSTrainer
 from .Loss import FasterGS2DLoss
 from .Renderer import RenderLayout
 
 
 class FasterGS2DTrainer(FasterGSTrainer):
+    # Disk density decisions use the current backward pass. Shadow the three
+    # stock callbacks so these updates run only in the shared trainer’s post-backward hook.
+    densify = reset_opacities = reset_opacities_extra = None
     loss_type = FasterGS2DLoss
     _configuration = deepcopy(FasterGSTrainer.get_default_parameters())
     _configuration.update(DENSIFICATION_GRAD_THRESHOLD=None, DENSIFICATION_MAX_SCREEN_SIZE=None,
                           DENSIFICATION_START_ITERATION=500, DENSIFICATION_END_ITERATION=15_000,
                           DENSIFICATION_OPACITY_CULL=.05, DISTORTION_START_ITERATION=3_000,
                           NORMAL_START_ITERATION=7_000)
-    _configuration.LOSS.update(LAMBDA_DISTORTION=0.0, LAMBDA_NORMAL=.05)
+    _configuration.LOSS.update(LAMBDA_DISTORTION=0.0, LAMBDA_NORMAL=.05, NORMAL_LOSS_MODE="normalized")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -63,18 +66,6 @@ class FasterGS2DTrainer(FasterGSTrainer):
             or (iteration == self.EXTRA_OPACITY_RESET_ITERATION
                 and bool(dataset.default_camera.background_color.any())))
 
-    @training_callback(priority=100, active=False)
-    def densify(self, *args):
-        """Reflective override: run after backward, not the inherited pre-loss callback."""
-
-    @training_callback(priority=90, active=False)
-    def reset_opacities(self, *args):
-        """Reflective override: reset after densify, before optimizer."""
-
-    @training_callback(priority=89, active=False)
-    def reset_opacities_extra(self, *args):
-        """Reflective override: folded into the explicit post-backward reset gate."""
-
     @torch.no_grad()
     def _run_densify(self, iteration, dataset):
         if self.DENSIFICATION_GRAD_THRESHOLD is None:
@@ -109,6 +100,7 @@ class FasterGS2DTrainer(FasterGSTrainer):
 
     @torch.no_grad()
     def _after_backward(self, iteration, dataset, view, rendered, collect):
+        """Accumulate shift gradients, densify, then reset opacities before the shared Adam step."""
         g = self.model.gaussians
         if collect:
             g.accumulate_image_shift(rendered["image_shift"].grad, rendered["metadata"],
