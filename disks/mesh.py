@@ -1,12 +1,17 @@
 """Fuse FasterGS2D training views into a colored TSDF mesh."""
 import argparse
 import math
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
 import open3d as o3d
 import torch
+
+if __name__ == '__main__' and not __package__:
+    # A direct script launch needs the enclosing NeRF-ICG src directory on the import path.
+    sys.path.insert(0, str(Path(__file__).absolute().parents[3]))
 
 import Framework
 from Implementations import Datasets, Methods

@@ -79,11 +79,11 @@ It scored 27.000 dB PSNR, 0.8554 SSIM and 0.1244 VGG-LPIPS on the same 24 views.
 
 ## Mesh extraction
 
-Install Open3D in the training environment. From the NeRF-ICG root, fuse
-expected depth and color from the training cameras into a TSDF volume:
+From the NeRF-ICG root, run the mesh script in the training environment with
+Open3D. It fuses expected depth and color from the training cameras into a TSDF volume:
 
 ```sh
-PYTHONPATH=src python -m Methods.FasterGS.disks.mesh config.yaml final.pt mesh.ply \
+python src/Methods/FasterGS/disks/mesh.py config.yaml final.pt mesh.ply \
     --voxel-size 0.025 --max-depth 14 --smooth 5
 ```
 
