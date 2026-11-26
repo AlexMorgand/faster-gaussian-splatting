@@ -94,6 +94,8 @@ _Note: The framework determines on-the-fly what extra modules need to be install
 
 ### Variants
 
+[FasterGS2D](docs/disks.md) trains two-axis Gaussian disks with the FasterGS CUDA backend.
+
 Installing one of our Faster-GS variants (e.g., `FasterGS4D`) from their respective branch can be achieved by
 ```shell
 # HTTPS
