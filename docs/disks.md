@@ -77,6 +77,28 @@ The matching runs before the backward change took 335 and 341 seconds.
 An earlier run of this Garden recipe also measured SSIM and VGG-LPIPS.
 It scored 27.000 dB PSNR, 0.8554 SSIM and 0.1244 VGG-LPIPS on the same 24 views.
 
+## Mesh extraction
+
+Install Open3D in the training environment. From the NeRF-ICG root, fuse
+expected depth and color from the training cameras into a TSDF volume:
+
+```sh
+PYTHONPATH=src python -m Methods.FasterGS.disks.mesh config.yaml final.pt mesh.ply \
+    --voxel-size 0.025 --max-depth 14 --smooth 5
+```
+
+These distances are in Barn checkpoint world units. For a smaller subject,
+pass `--sphere X Y Z R` and choose a voxel width for that region. A width
+of `R / 200` resolved the Bicycle frame and bench slats. For a subject
+framed near the center, `--auto-foreground --max-depth D` estimates a
+sphere and voxel width from every third view before fusing all views.
+
+The default truncation band spans four voxels. On Open3D builds with a
+configurable extraction weight, the exporter requests weight 3. Other
+legacy builds use their built-in policy. For previews, `--depth-stride 2`
+samples fewer pixels for block allocation. Fusion inside each allocated
+block still uses full-resolution depth.
+
 ## Build and numerical checks
 
 Use the normal documented NeRFICG/FasterGS prerequisites and matching CUDA
