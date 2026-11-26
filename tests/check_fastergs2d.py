@@ -299,8 +299,10 @@ def main():
     original_densify = model.gaussians.adaptive_density_control
     model.gaussians.adaptive_density_control = lambda *args, **kwargs: observed.append((args, kwargs))
     trainer._last_opacity_reset_iteration = 3000
-    trainer._run_densify(3100, dataset)
-    trainer._run_densify(3200, dataset)
+    for iteration, requires_empty_cache in ((3100, True), (3200, False)):
+        with patch.object(trainer, "requires_empty_cache", requires_empty_cache), patch("torch.cuda.empty_cache") as flush:
+            trainer._run_densify(iteration, dataset)
+            assert flush.call_count == int(requires_empty_cache)
     assert observed[0][0][1] is None and observed[0][0][2] is False
     assert observed[1][0][1] == .05 and observed[1][0][2] is True
     model.gaussians.adaptive_density_control = original_densify

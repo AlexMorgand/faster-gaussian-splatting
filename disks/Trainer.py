@@ -81,6 +81,10 @@ class FasterGS2DTrainer(FasterGSTrainer):
             self.DENSIFICATION_GRAD_THRESHOLD, None if grace else self.DENSIFICATION_OPACITY_CULL,
             large, additional_prune_mask=screen_mask)
         gaussians.reset_densification_info(False)
+        # Match FasterGS on allocators without expandable segments (including GUI training).
+        # The rasterizer queries driver-free memory, which excludes unused cached blocks.
+        if self.requires_empty_cache:
+            torch.cuda.empty_cache()
 
     def _render_training_view(self, iteration, view, bg_color, collect):
         normal_active = iteration > self.NORMAL_START_ITERATION
