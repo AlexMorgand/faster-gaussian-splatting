@@ -15,7 +15,7 @@ from Methods.Base.Model import BaseModel
 from Cameras.utils import quaternion_to_rotation_matrix
 from Methods.FasterGS.utils import rgb_to_sh0
 from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, relocation_adjustment, add_noise
-from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
+from Optim.adam_utils import replace_param_group_data, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
 from Optim.knn_utils import compute_root_mean_squared_knn_distances
 from Optim.ppisp import PPISPWrapper
@@ -23,6 +23,8 @@ from Optim.ppisp import PPISPWrapper
 
 class Gaussians(torch.nn.Module):
     """Stores a set of 3D Gaussians."""
+    initial_distances = staticmethod(compute_root_mean_squared_knn_distances)
+    scale_dim = 3
 
     def __init__(self, sh_degree: int, pretrained: bool) -> None:
         super().__init__()
@@ -129,8 +131,7 @@ class Gaussians(torch.nn.Module):
     def covariances(self) -> torch.Tensor:
         """Returns the Gaussians' covariance matrices (N, 3, 3)."""
         R = quaternion_to_rotation_matrix(self.rotations, normalize=False)
-        S = torch.diag_embed(self.scales)
-        RS = R @ S
+        RS = R[:, :, :self.scale_dim] @ torch.diag_embed(self.scales)
         return RS @ RS.transpose(-2, -1)
 
     def opacity_regularization_loss(self) -> torch.Tensor:
@@ -213,9 +214,9 @@ class Gaussians(torch.nn.Module):
             sh_coefficients_0 = rgb_to_sh0(point_cloud.colors.cuda()[:, None, :])
         sh_coefficients_rest = torch.zeros((n_initial_gaussians, (self.max_sh_degree + 1) ** 2 - 1, 3), dtype=torch.float32, device='cuda')
         # initial scales
-        distances = compute_root_mean_squared_knn_distances(means)
+        distances = self.initial_distances(means)
         distances = distances * 0.1 if use_mcmc else distances
-        scales = distances.log()[..., None].repeat(1, 3)
+        scales = distances.log()[..., None].repeat(1, self.scale_dim)
         # initial rotations
         rotations = torch.zeros((n_initial_gaussians, 4), dtype=torch.float32, device='cuda')
         rotations[:, 0] = 1.0
@@ -275,23 +276,16 @@ class Gaussians(torch.nn.Module):
 
     def prune(self, prune_mask: torch.Tensor) -> None:
         """Prunes Gaussians that are not visible or too large."""
-        valid_mask = ~prune_mask
-        param_groups = prune_param_groups(self.optimizer, valid_mask)
-
-        self._means = param_groups['means']
-        self._sh_coefficients_0 = param_groups['sh_coefficients_0']
-        self._sh_coefficients_rest = param_groups['sh_coefficients_rest']
-        self._opacities = param_groups['opacities']
-        self._scales = param_groups['scales']
-        self._rotations = param_groups['rotations']
-
-        if self._densification_info is not None:
-            self._densification_info = self._densification_info[:, valid_mask].contiguous()
-        if self._filter_3d is not None:
-            self._filter_3d = self._filter_3d[valid_mask].contiguous()
+        if prune_mask.dtype != torch.bool or prune_mask.shape != (len(self._means),):
+            raise ValueError('expected one boolean prune decision per Gaussian')
+        self._select_rows(torch.where(~prune_mask)[0])
 
     def sort(self, ordering: torch.Tensor) -> None:
         """Applies the given ordering to the Gaussians."""
+        self._select_rows(ordering)
+
+    def _select_rows(self, ordering: torch.Tensor) -> None:
+        """Keep parameters, Adam moments and per-Gaussian observations in the same order."""
         param_groups = sort_param_groups(self.optimizer, ordering)
 
         self._means = param_groups['means']
@@ -311,7 +305,8 @@ class Gaussians(torch.nn.Module):
         n_rows = 3 if use_abs_grad else 2
         self._densification_info = torch.zeros((n_rows, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
-    def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
+    def adaptive_density_control(self, grad_threshold: float, min_opacity: float | None, prune_large_gaussians: bool,
+                                 additional_prune_mask: torch.Tensor | None = None) -> None:
         """Densify Gaussians and prune those that are not visible or too large."""
         denominator = self.densification_info[0].clamp_min(1.0)
         densification_mask = self.densification_info[1] >= grad_threshold * denominator
@@ -324,37 +319,29 @@ class Gaussians(torch.nn.Module):
                 densification_mask |= grads_abs >= abs_grad_threshold
         is_small = torch.max(self._scales, dim=1).values <= math.log(self.percent_dense * self.training_cameras_extent)
 
-        # duplicate small gaussians
-        duplicate_mask = densification_mask & is_small
-        n_new_gaussians_duplicate = duplicate_mask.sum().item()
-        duplicated_means = self._means[duplicate_mask]
-        duplicated_sh_coefficients_0 = self._sh_coefficients_0[duplicate_mask]
-        duplicated_sh_coefficients_rest = self._sh_coefficients_rest[duplicate_mask]
-        duplicated_opacities = self._opacities[duplicate_mask]
-        duplicated_scales = self._scales[duplicate_mask]
-        duplicated_rotations = self._rotations[duplicate_mask]
-
-        # split large gaussians
+        # A small parent makes one clone. A large parent makes two children and is pruned below.
         split_mask = densification_mask & ~is_small
-        n_new_gaussians_split = 2 * split_mask.sum().item()
-        split_scales = self._scales[split_mask].exp().expand(2, -1, -1).flatten(end_dim=1)
-        split_rotations = self._rotations[split_mask].expand(2, -1, -1).flatten(end_dim=1)
-        offsets = (quaternion_to_rotation_matrix(split_rotations) @ (split_scales * torch.randn_like(split_scales))[..., None])[..., 0]
-        split_means = self._means[split_mask].expand(2, -1, -1).flatten(end_dim=1) + offsets
-        split_scales = split_scales.mul(0.625).log()  # 1 / 1.6 = 0.625
-        split_sh_coefficients_0 = self._sh_coefficients_0[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
-        split_sh_coefficients_rest = self._sh_coefficients_rest[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
-        split_opacities = self._opacities[split_mask].expand(2, -1, -1).flatten(end_dim=1)
+        clones = torch.where(densification_mask & is_small)[0]
+        splits = torch.where(split_mask)[0]
+        parents = torch.cat((clones, splits, splits))
+        split_children = slice(len(clones), None)
 
-        # incorporate
-        n_new_gaussians = n_new_gaussians_duplicate + n_new_gaussians_split
+        means = self._means[parents]
+        scales = self._scales[parents]
+        rotations = self._rotations[parents]
+        split_scales = scales[split_children].exp()
+        axes = quaternion_to_rotation_matrix(rotations[split_children])[:, :, :self.scale_dim]
+        offsets = split_scales * torch.randn_like(split_scales)
+        means[split_children] += (axes @ offsets.unsqueeze(-1)).squeeze(-1)
+        scales[split_children] = (0.625 * split_scales).log()
+
         param_groups = extend_param_groups(self.optimizer, {
-            'means': torch.cat([duplicated_means, split_means]),
-            'sh_coefficients_0': torch.cat([duplicated_sh_coefficients_0, split_sh_coefficients_0]),
-            'sh_coefficients_rest': torch.cat([duplicated_sh_coefficients_rest, split_sh_coefficients_rest]),
-            'opacities': torch.cat([duplicated_opacities, split_opacities]),
-            'scales': torch.cat([duplicated_scales, split_scales]),
-            'rotations': torch.cat([duplicated_rotations, split_rotations])
+            'means': means,
+            'sh_coefficients_0': self._sh_coefficients_0[parents],
+            'sh_coefficients_rest': self._sh_coefficients_rest[parents],
+            'opacities': self._opacities[parents],
+            'scales': scales,
+            'rotations': rotations,
         })
         self._means = param_groups['means']
         self._sh_coefficients_0 = param_groups['sh_coefficients_0']
@@ -368,11 +355,14 @@ class Gaussians(torch.nn.Module):
         self._filter_3d = None
 
         # prune
-        prune_mask = torch.cat([split_mask, torch.zeros(n_new_gaussians, dtype=torch.bool, device='cuda')])
-        prune_mask |= self._opacities.flatten() < math.log(min_opacity / (1 - min_opacity))
+        prune_mask = torch.cat([split_mask, split_mask.new_zeros(len(parents))])
+        if min_opacity is not None:
+            prune_mask |= self._opacities.flatten() < math.log(min_opacity / (1 - min_opacity))
         prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
         if prune_large_gaussians:
             prune_mask |= self._scales.max(dim=1).values > math.log(0.1 * self.training_cameras_extent)
+        if additional_prune_mask is not None:
+            prune_mask[:len(split_mask)] |= additional_prune_mask
         self.prune(prune_mask)
 
     def mcmc_densification(self, min_opacity: float, cap_max: int) -> None:
@@ -551,7 +541,7 @@ class Gaussians(torch.nn.Module):
             + ['f_dc_0', 'f_dc_1', 'f_dc_2']                     # 0-th SH degree coefficients
             + [f'f_rest_{i}' for i in range(sh_rest.shape[-1])]  # remaining SH degree coefficients
             + ['opacity']                                        # opacity (pre-activation)
-            + ['scale_0', 'scale_1', 'scale_2']                  # 3d scale (pre-activation)
+            + [f'scale_{i}' for i in range(self.scale_dim)]      # tangent/3d log-scales
             + ['rot_0', 'rot_1', 'rot_2', 'rot_3']               # rotation quaternion
         )
         dtype = 'f4'  # store all attributes as float32 for compatibility
@@ -574,6 +564,7 @@ class Gaussians(torch.nn.Module):
 )
 class FasterGSModel(BaseModel):
     """Defines the FasterGS model."""
+    gaussian_type = Gaussians
 
     def __init__(self, name: str = None) -> None:
         super().__init__(name)
@@ -583,7 +574,7 @@ class FasterGSModel(BaseModel):
     def build(self) -> 'FasterGSModel':
         """Builds the model."""
         pretrained = self.num_iterations_trained > 0
-        self.gaussians = Gaussians(self.SH_DEGREE, pretrained)
+        self.gaussians = self.gaussian_type(self.SH_DEGREE, pretrained)
         if self.PPISP.USE:
             self.ppisp = PPISPWrapper(self.PPISP)
         return self

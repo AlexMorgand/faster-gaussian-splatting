@@ -53,8 +53,10 @@ def extract_settings(
 class FasterGSRenderer(BaseRenderer):
     """Wrapper around the rasterization module from 3DGS."""
 
+    model_type = FasterGSModel
+
     def __init__(self, model: 'BaseModel') -> None:
-        super().__init__(model, [FasterGSModel])
+        super().__init__(model, [self.model_type])
         if not Framework.config.GLOBAL.GPU_INDICES:
             raise Framework.RendererError('FasterGS renderer not implemented in CPU mode')
         if len(Framework.config.GLOBAL.GPU_INDICES) > 1:

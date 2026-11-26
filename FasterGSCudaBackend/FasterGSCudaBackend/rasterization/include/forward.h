@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buffer_utils.h"
+#include "disks.h"
 #include "helper_math.h"
 #include <functional>
 #include <tuple>
@@ -34,7 +35,8 @@ namespace faster_gs::rasterization {
         const float near_plane,
         const float far_plane,
         const bool proper_antialiasing,
-        const cudaStream_t stream);
+        const cudaStream_t stream,
+        const DiskRasterization* disks = nullptr);
 
     template <typename KeyT>
     void diff_rasterize(
@@ -54,6 +56,7 @@ namespace faster_gs::rasterization {
         const int width,
         const int height,
         int& n_buckets,
-        int& instance_primitive_indices_selector);
+        int& instance_primitive_indices_selector,
+        const DiskRasterization* disks);
 
 }

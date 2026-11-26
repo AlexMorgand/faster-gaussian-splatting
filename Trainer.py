@@ -69,6 +69,8 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
 class FasterGSTrainer(GuiTrainer):
     """Defines the trainer for the FasterGS variant."""
 
+    loss_type = FasterGSLoss
+
     def __init__(self, **kwargs) -> None:
         self.requires_empty_cache = True
         if not Framework.config.TRAINING.GUI.ACTIVATE:
@@ -110,7 +112,7 @@ class FasterGSTrainer(GuiTrainer):
             self.model.gaussians.setup_3d_filter(self.FILTER_3D, dataset)
         if self.model.ppisp is not None:
             self.model.ppisp.initialize(dataset, self.NUM_ITERATIONS)
-        self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
+        self.loss = self.loss_type(loss_config=self.LOSS, model=self.model)
 
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
@@ -168,6 +170,14 @@ class FasterGSTrainer(GuiTrainer):
             Logger.log_info('resetting opacities one additional time because using non-black background')
             self.model.gaussians.reset_opacities()
 
+    def _render_training_view(self, iteration, view, bg_color, collect):
+        return self.renderer.render_image_training(
+            view=view, update_densification_info=collect, bg_color=bg_color,
+        )
+
+    def _after_backward(self, iteration, dataset, view, rendered, collect):
+        """Apply method-specific updates that require gradients before Adam steps."""
+
     @training_callback(priority=80)
     def training_iteration(self, iteration: int, dataset: 'BaseDataset') -> None:
         """Performs a training step."""
@@ -181,19 +191,17 @@ class FasterGSTrainer(GuiTrainer):
         view = self.train_sampler.get(dataset=dataset)['view']
         # render
         bg_color = torch.rand_like(view.camera.background_color) if self.USE_RANDOM_BACKGROUND_COLOR else view.camera.background_color
-        image = self.renderer.render_image_training(
-            view=view,
-            update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
-            bg_color=bg_color,
-        )
+        collect = not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION
+        rendered = self._render_training_view(iteration, view, bg_color, collect)
         # calculate loss
         # compose gt with background color if needed  # FIXME: integrate into data model
         rgb_gt = view.rgb
         if (alpha_gt := view.alpha) is not None:
             rgb_gt = apply_background_color(rgb_gt, alpha_gt, bg_color)
-        loss = self.loss(image, rgb_gt)
+        loss = self.loss(rendered, rgb_gt)
         # backward
         loss.backward()
+        self._after_backward(iteration, dataset, view, rendered, collect)
         # optimizer step
         self.model.gaussians.optimizer.step()
         self.model.gaussians.optimizer.zero_grad()

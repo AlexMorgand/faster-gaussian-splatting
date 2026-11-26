@@ -9,6 +9,10 @@ from Optim.Losses.DSSIM import fused_dssim
 from Methods.FasterGS.Model import FasterGSModel
 
 
+def _zero_ppisp_regularization() -> float:
+    return 0.0
+
+
 class FasterGSLoss(BaseLoss):
     def __init__(self, loss_config: ConfigParameterList, model: FasterGSModel) -> None:
         super().__init__()
@@ -17,17 +21,18 @@ class FasterGSLoss(BaseLoss):
         self.add_loss_metric('OPACITY_REGULARIZATION', model.gaussians.opacity_regularization_loss, loss_config.LAMBDA_OPACITY_REGULARIZATION)
         self.add_loss_metric('SCALE_REGULARIZATION', model.gaussians.scale_regularization_loss, loss_config.LAMBDA_SCALE_REGULARIZATION)
         if model.ppisp is None:
-            self.add_loss_metric('PPISP_REGULARIZATION', lambda: 0.0, 0.0)
+            self.add_loss_metric('PPISP_REGULARIZATION', _zero_ppisp_regularization, 0.0)
         else:
             self.add_loss_metric('PPISP_REGULARIZATION', model.ppisp.model.get_regularization_loss, 1.0)
         self.add_quality_metric('PSNR', torchmetrics.functional.image.peak_signal_noise_ratio)
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, target: torch.Tensor, **extra_metrics) -> torch.Tensor:
         return super().forward({
             'L1_Color': {'input': input, 'target': target},
             'DSSIM_Color': {'input': input, 'target': target},
             'OPACITY_REGULARIZATION': {},
             'SCALE_REGULARIZATION': {},
             'PPISP_REGULARIZATION': {},
-            'PSNR': {'preds': input, 'target': target, 'data_range': 1.0}
+            'PSNR': {'preds': input, 'target': target, 'data_range': 1.0},
+            **extra_metrics,
         })

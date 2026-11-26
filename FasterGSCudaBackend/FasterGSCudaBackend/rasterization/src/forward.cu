@@ -6,6 +6,8 @@
 #include "helper_math.h"
 #include <cub/cub.cuh>
 #include <functional>
+#include <stdexcept>
+#include <string>
 
 // sorting is done separately for depth and tile as proposed in https://github.com/m-schuetz/Splatshop
 std::tuple<int, int, int> faster_gs::rasterization::forward(
@@ -35,7 +37,8 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
     const float near_plane,
     const float far_plane,
     const bool proper_antialiasing,
-    const cudaStream_t stream)
+    const cudaStream_t stream,
+    const DiskRasterization* disks)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const dim3 block(config::tile_width, config::tile_height, 1);
@@ -52,7 +55,13 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
 
     cudaMemsetAsync(primitive_buffers.counters, 0, sizeof(uint2), stream);
 
-    kernels::forward::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess, 0, stream>>>(
+    if (disks) {
+        preprocess_disks(means, reinterpret_cast<const float2*>(scales), rotations,
+            opacities, sh_coefficients_0, sh_coefficients_rest, w2c, cam_position,
+            primitive_buffers, *disks, n_primitives, active_sh_bases, total_sh_bases,
+            width, height, stream);
+    } else {
+      kernels::forward::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess, 0, stream>>>(
         means,
         scales,
         rotations,
@@ -84,31 +93,44 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
         far_plane,
         proper_antialiasing
     );
+    }
     CHECK_CUDA(config::debug, "preprocess")
 
     uint2 counters;
     cudaMemcpyAsync(&counters, primitive_buffers.counters, sizeof(uint2), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    unsigned long long disk_instances = 0;
+    if (disks && cudaMemcpyAsync(&disk_instances, disks->instance_counter, sizeof(disk_instances),
+                                 cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        throw std::runtime_error("FasterGS2D actual-count readback failed");
+    const auto sync_error = cudaStreamSynchronize(stream);
+    if (disks && sync_error != cudaSuccess)
+        throw std::runtime_error(std::string("FasterGS2D preprocessing failed: ")+cudaGetErrorString(sync_error));
+    if (disks && disk_instances > disks->instance_limit)
+        throw std::runtime_error("FasterGS2D resource guard: instance/buffer actual demand exceeds cap (actual_instances="
+                                 +std::to_string(disk_instances)+", limit="+std::to_string(disks->instance_limit)+")");
     const int n_visible_primitives = counters.x;
-    const int n_instances = counters.y;
+    const int n_instances = disks ? static_cast<int>(disk_instances) : counters.y;
+    if (disks && disks->preflight_only) return {n_instances, 0, 0};
 
     cub::DeviceRadixSort::SortPairs(
         primitive_buffers.cub_workspace,
         primitive_buffers.cub_workspace_size,
         primitive_buffers.depth_keys,
         primitive_buffers.primitive_indices,
-        n_visible_primitives,
+        disks ? n_primitives : n_visible_primitives,
         0, sizeof(uint) * 8,
         stream
     );
     CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (depth)")
 
-    kernels::forward::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering, 0, stream>>>(
+    if (n_visible_primitives > 0) {
+      kernels::forward::apply_depth_ordering_cu<<<div_round_up(n_visible_primitives, config::block_size_apply_depth_ordering), config::block_size_apply_depth_ordering, 0, stream>>>(
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.n_touched_tiles,
         primitive_buffers.offset,
         n_visible_primitives
     );
+    }
     CHECK_CUDA(config::debug, "apply_depth_ordering")
 
     cub::DeviceScan::ExclusiveSum(
@@ -142,7 +164,8 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
         width, \
         height, \
         n_buckets, \
-        instance_primitive_indices_selector
+        instance_primitive_indices_selector, \
+        disks
     if (end_bit <= 16) diff_rasterize<ushort>(DIFF_RASTERIZE_ARGS);
     else diff_rasterize<uint>(DIFF_RASTERIZE_ARGS);
     #undef DIFF_RASTERIZE_ARGS
@@ -168,12 +191,18 @@ void faster_gs::rasterization::diff_rasterize(
     const int width,
     const int height,
     int& n_buckets,
-    int& instance_primitive_indices_selector)
+    int& instance_primitive_indices_selector,
+    const DiskRasterization* disks)
 {
-    char* instance_buffers_blob = resize_instance_buffers(required<InstanceBuffers<KeyT>>(n_instances, end_bit));
+    const size_t instance_bytes = required<InstanceBuffers<KeyT>>(n_instances, end_bit);
+    const size_t mask_offset = (instance_bytes + alignof(uint) - 1) & ~(size_t(alignof(uint)) - 1);
+    const size_t mask_words = size_t(n_instances / 32 + n_tiles) * config::block_size_blend;
+    char* instance_buffers_blob = resize_instance_buffers(disks ? mask_offset + mask_words * sizeof(uint) : instance_bytes);
+    uint* hit_masks = disks ? reinterpret_cast<uint*>(instance_buffers_blob + mask_offset) : nullptr;
     InstanceBuffers<KeyT> instance_buffers = InstanceBuffers<KeyT>::from_blob(instance_buffers_blob, n_instances, end_bit);
 
-    kernels::forward::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances, 0, stream>>>(
+    if (n_visible_primitives > 0) {
+      kernels::forward::create_instances_cu<KeyT><<<div_round_up(n_visible_primitives, config::block_size_create_instances), config::block_size_create_instances, 0, stream>>>(
         primitive_buffers.primitive_indices.Current(),
         primitive_buffers.offset,
         primitive_buffers.screen_bounds,
@@ -184,6 +213,7 @@ void faster_gs::rasterization::diff_rasterize(
         grid.x,
         n_visible_primitives
     );
+    }
     CHECK_CUDA(config::debug, "create_instances")
 
     cub::DeviceRadixSort::SortPairs(
@@ -206,6 +236,13 @@ void faster_gs::rasterization::diff_rasterize(
             n_instances
         );
         CHECK_CUDA(config::debug, "extract_instance_ranges")
+    }
+
+    if (disks) {
+        n_buckets = n_instances / 32 + n_tiles;  // Preserve the native state tuple's bucket upper bound.
+        blend_disks(primitive_buffers, tile_buffers, instance_buffers.primitive_indices.Current(),
+            hit_masks, bg_color, image, *disks, width, height, stream);
+        return;
     }
 
     kernels::forward::extract_bucket_counts<<<div_round_up(n_tiles, config::block_size_extract_bucket_counts), config::block_size_extract_bucket_counts, 0, stream>>>(
